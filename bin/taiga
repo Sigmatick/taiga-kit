@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""taiga — работа с трекером Taiga из папки проекта.
+
+Где лежит токен, решает конфиг проекта (.claude/tracker.local.md, ищется вверх
+от текущей папки): ключи token_file / refresh_file. Нет конфига — берутся
+общие на пользователя ~/.taiga.{url,token,refresh}.
+
+Секрет в конфиг не пишется никогда — только путь к нему.
+"""
+import argparse, getpass, json, os, re, sys, pathlib, subprocess, urllib.request, urllib.error
+
+HOME = pathlib.Path.home()
+DEF_URL, DEF_TOK, DEF_REF = HOME/".taiga.url", HOME/".taiga.token", HOME/".taiga.refresh"
+KINDS = {"us": ("userstories","userstory","userstory-statuses","история"),
+         "task": ("tasks","task","task-statuses","задача"),
+         "issue": ("issues","issue","issue-statuses","вопрос"),
+         "epic": ("epics","epic","epic-statuses","эпик")}
+def die(m): print(f"останов: {m}", file=sys.stderr); sys.exit(1)
+def ok(m): print(m)
+
+# ── конфиг проекта ───────────────────────────────────────────────────────────
+class Conf:
+    def __init__(self):
+        self.path = self.root = self.slug = None
+        self.url_f, self.tok_f, self.ref_f = DEF_URL, DEF_TOK, DEF_REF
+        self.base_url = None
+        d = pathlib.Path.cwd().resolve()
+        for p in [d, *d.parents]:
+            f = p/".claude"/"tracker.local.md"
+            if f.is_file(): self.path, self.root = f, p; break
+        if not self.path: return
+        txt = self.path.read_text()
+        fm = txt.split("---")[1] if txt.startswith("---") else ""
+        def key(k):
+            m = re.search(rf"^{k}:\s*(\S+)\s*$", fm, re.M)
+            return m.group(1) if m else None
+        self.base_url = key("base_url")
+        for attr, k in (("tok_f","token_file"), ("ref_f","refresh_file")):
+            v = key(k)
+            if v: setattr(self, attr, self._resolve(v))
+        if key("token_file"):                      # url кладём рядом с токеном
+            self.url_f = self.tok_f.with_name(self.tok_f.name.replace("token","url")) \
+                         if "token" in self.tok_f.name else self.root/".taiga"/"url"
+        m = re.search(r"^\|\s*([a-z0-9][a-z0-9._-]*)\s*\|", txt, re.M)
+        self.slug = m.group(1) if m else None
+    def _resolve(self, v):
+        p = pathlib.Path(os.path.expanduser(v))
+        return p if p.is_absolute() else (self.root/p)
+
+C = Conf()
+
+def base():
+    if C.base_url: return C.base_url.rstrip("/")
+    if C.url_f.is_file(): return C.url_f.read_text().strip().rstrip("/")
+    if DEF_URL.is_file(): return DEF_URL.read_text().strip().rstrip("/")
+    die("адрес инстанса неизвестен — выполните `taiga login`")
+
+def tok():
+    if os.environ.get("TAIGA_TOKEN"): return os.environ["TAIGA_TOKEN"].strip()
+    for f in (C.tok_f, DEF_TOK):
+        if f.is_file() and f.read_text().strip(): return f.read_text().strip()
+    die(f"токена нет ({C.tok_f}) — выполните `taiga login`")
+
+def write_secret(p, v):
+    p.parent.mkdir(parents=True, exist_ok=True); os.chmod(p.parent, 0o700)
+    t = p.with_suffix(p.suffix+".tmp"); t.write_text(v); os.chmod(t, 0o600)
+    t.replace(p); os.chmod(p, 0o600)
+
+def guard_gitignore(d: pathlib.Path):
+    """Игнор дописывается ДО записи секрета: иначе окно, в которое попадёт git add -A."""
+    try: root = pathlib.Path(subprocess.run(["git","rev-parse","--show-toplevel"], cwd=d,
+                 capture_output=True, text=True, check=True).stdout.strip())
+    except Exception: return
+    gi = root/".gitignore"; line = ".taiga/"
+    cur = gi.read_text() if gi.is_file() else ""
+    if line not in cur.split():
+        gi.write_text(cur + ("" if cur.endswith("\n") or not cur else "\n") + line + "\n")
+        ok(f"в {gi} дописано «{line}»")
+
+# ── транспорт ────────────────────────────────────────────────────────────────
+def raw(method, path, body=None, token=None, nopage=False):
+    r = urllib.request.Request(base()+"/api/v1"+path, method=method,
+                               data=json.dumps(body).encode() if body is not None else None)
+    r.add_header("Authorization", "Bearer " + (token or tok()))
+    if body is not None: r.add_header("Content-Type", "application/json")
+    if nopage: r.add_header("x-disable-pagination", "True")
+    try:
+        with urllib.request.urlopen(r, timeout=60) as x:
+            t = x.read().decode(); return x.status, (json.loads(t) if t.strip() else None)
+    except urllib.error.HTTPError as e:
+        t = e.read().decode()
+        try: return e.code, json.loads(t)
+        except Exception: return e.code, t[:300]
+    except Exception as e: die(f"сеть: {e}")
+
+def do_refresh(quiet=False):
+    f = C.ref_f if C.ref_f.is_file() else DEF_REF
+    if not f.is_file(): return False
+    req = urllib.request.Request(base()+"/api/v1/auth/refresh",
+                                 data=json.dumps({"refresh": f.read_text().strip()}).encode())
+    req.add_header("Content-Type","application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=45) as x: d = json.loads(x.read().decode())
+    except Exception: return False
+    write_secret(C.tok_f if C.tok_f.is_file() else DEF_TOK, d["auth_token"])
+    if d.get("refresh"): write_secret(f, d["refresh"])
+    if not quiet: ok("токен обновлён")
+    return True
+
+IDENTITY = None
+def auth():
+    """Канарейка первым вызовом: Taiga на анонимный запрос отвечает 200 и []."""
+    global IDENTITY
+    if IDENTITY: return IDENTITY
+    c, me = raw("GET", "/users/me")
+    if c != 200:
+        if not do_refresh(): die("токен истёк и refresh не принят — выполните `taiga login`")
+        c, me = raw("GET", "/users/me")
+        if c != 200: die(f"канарейка {c} после refresh")
+    IDENTITY = me; return me
+
+def api(method, path, body=None, nopage=False):
+    auth(); return raw(method, path, body, nopage=nopage)
+
+# ── справочники ──────────────────────────────────────────────────────────────
+def project(args):
+    slug = args.project or C.slug
+    if not slug: die("проект не задан: ключ -p <слаг>, или `taiga init <слаг>` в этой папке")
+    c, p = api("GET", f"/projects/by_slug?slug={slug}")
+    if c != 200: die(f"проект «{slug}» не найден ({c}) — см. `taiga projects`")
+    return p
+
+def resolve_status(pid, kind, text):
+    c, st = api("GET", f"/{KINDS[kind][2]}?project={pid}"); st = st or []
+    hit = [s for s in st if s["name"].lower()==text.lower()] or \
+          [s for s in st if text.lower() in s["name"].lower()]
+    if not hit: die(f"статус «{text}» не найден. Есть: " + ", ".join(s["name"] for s in st))
+    if len(hit) > 1: die(f"«{text}» подходит нескольким: " + ", ".join(s["name"] for s in hit))
+    return hit[0]
+
+def resolve_member(pid, text):
+    c, ms = api("GET", f"/memberships?project={pid}")
+    live = [m for m in (ms or []) if m.get("user")]   # приглашённые (user=null) отбрасываются
+    hit = [m for m in live if text.lower() in (m.get("full_name") or "").lower()
+           or text.lower() in (m.get("user_email") or "").lower()]
+    if not hit: die(f"«{text}» не найден среди участников проекта")
+    if len(hit) > 1: die("подходят несколько: " + ", ".join(m["full_name"] for m in hit))
+    return hit[0]
+
+def find_item(pid, ref, kind=None):
+    ref = int(re.sub(r"\D","",str(ref)))
+    for k in ([kind] if kind else ["us","task","issue","epic"]):
+        c, d = api("GET", f"/{KINDS[k][0]}/by_ref?ref={ref}&project={pid}")
+        if c == 200 and d: return k, d
+    die(f"#{ref} не найден в проекте")
+
+def confirm(args, text):
+    print(text)
+    if args.yes: return True
+    if not sys.stdin.isatty(): die("нужно подтверждение, а ввода нет — добавьте -y")
+    return input("выполнить? [y/N] ").strip().lower() in ("y","yes","д","да")
+
+# ── команды ──────────────────────────────────────────────────────────────────
+def cmd_login(args):
+    if not sys.stdin.isatty(): die("логин требует терминала: пароль не берётся из потока")
+    cur = None
+    for f in (C.url_f, DEF_URL):
+        if f.is_file(): cur = f.read_text().strip(); break
+    url = input(f"адрес инстанса{f' [{cur}]' if cur else ''}: ").strip() or cur or ""
+    if not url: die("адрес не задан")
+    url = url.rstrip("/")
+    user = input("логин или email: ").strip()
+    pw = getpass.getpass("пароль (не отображается): ")
+    req = urllib.request.Request(url+"/api/v1/auth",
+        data=json.dumps({"type":"normal","username":user,"password":pw}).encode())
+    req.add_header("Content-Type","application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=45) as x: d = json.loads(x.read().decode())
+    except urllib.error.HTTPError as e: die(f"логин отклонён: {e.code} (проверьте логин и пароль)")
+    if args.here:
+        root = pathlib.Path.cwd().resolve()
+        guard_gitignore(root)                      # игнор ДО записи секрета
+        u,t,r = root/".taiga"/"url", root/".taiga"/"token", root/".taiga"/"refresh"
+    else:
+        u,t,r = DEF_URL, DEF_TOK, DEF_REF
+    write_secret(u,url); write_secret(t,d["auth_token"])
+    if d.get("refresh"): write_secret(r,d["refresh"])
+    ok(f"вход выполнен: {d.get('full_name_display') or d.get('username')} (id {d['id']})")
+    ok(f"токен записан: {t} (права 600)")
+
+def cmd_refresh(args): ok("обновлено" if do_refresh(quiet=True) else "refresh не принят — нужен `taiga login`")
+
+def cmd_status(args):
+    me = auth()
+    ok(f"инстанс:  {base()}")
+    ok(f"личность: {me.get('full_name_display') or me.get('username')} (id {me['id']})")
+    ok(f"конфиг:   {C.path or '— не найден в этой папке и выше'}")
+    ok(f"проект:   {C.slug or '— не задан'}")
+    ok(f"токен:    {C.tok_f if C.tok_f.is_file() else DEF_TOK}")
+
+def cmd_projects(args):
+    c, ps = api("GET", "/projects")
+    if ps == []: die("список пуст при подтверждённой личности — подозрительно")
+    print(f"{'СЛАГ':<22}{'ID':>4}  НАЗВАНИЕ")
+    for p in sorted(ps, key=lambda x: x["slug"]): print(f"{p['slug']:<22}{p['id']:>4}  {p['name']}")
+
+def cmd_init(args):
+    c, p = api("GET", f"/projects/by_slug?slug={args.slug}")
+    if c != 200: die(f"проект «{args.slug}» не найден ({c}) — см. `taiga projects`")
+    d = pathlib.Path.cwd()/".claude"; d.mkdir(parents=True, exist_ok=True)
+    f = d/"tracker.local.md"
+    if f.exists() and not args.force: die(f"{f} уже есть — перезаписать можно с --force")
+    tf, rf = (".taiga/token", ".taiga/refresh") if args.here else ("~/.taiga.token","~/.taiga.refresh")
+    f.write_text(f"""---
+tracker: rest
+base_url: {base()}
+token_file: {tf}
+refresh_file: {rf}
+---
+
+# Конфиг трекера
+
+Секретов здесь нет: указан путь к файлу с токеном, а не сам токен.
+{'Токен на проект: `.taiga/` в корне, каталог 700, файлы 600, строка в .gitignore.' if args.here else 'Токен общий на пользователя.'}
+
+## Проекты
+
+| Идентификатор | Назначение | Активен | Процесс |
+|---|---|---|---|
+| {p['slug']} | {args.name or p['name']} (id {p['id']}) | да | канбан |
+
+## Статусы
+
+Не кэшируются: идентификаторы пер-проектные, запрашиваются по факту обращения.
+
+## Связь задачи и работы
+
+- шаблон трейлера коммита: `Задача: #<номер>`
+- шаблон идентификатора задачи: `#?(\\d+)`
+""")
+    ok(f"подключено: {f}")
+    ok(f"проект «{p['name']}» (слаг {p['slug']}, id {p['id']})")
+    if args.here: ok("токен ожидается в .taiga/ — выполните `taiga login --here` здесь же")
+
+def cmd_ls(args):
+    p = project(args); kind = args.kind or "us"
+    c, items = api("GET", f"/{KINDS[kind][0]}?project={p['id']}", nopage=True); items = items or []
+    if args.open: items = [i for i in items if not i["is_closed"]]
+    if args.mine: items = [i for i in items if i.get("assigned_to") == IDENTITY["id"]]
+    if args.status: items = [i for i in items if args.status.lower() in
+                             (i.get("status_extra_info") or {}).get("name","").lower()]
+    ok(f"{p['name']} · {KINDS[kind][3]}: {len(items)}")
+    for i in sorted(items, key=lambda x: -x["ref"]):
+        who = (i.get("assigned_to_extra_info") or {}).get("full_name_display") or "—"
+        print(f"  #{i['ref']:<5} [{(i.get('status_extra_info') or {}).get('name','?'):<14}] "
+              f"{i['subject'][:56]:<58} {who}")
+
+def cmd_show(args):
+    p = project(args); kind, it = find_item(p["id"], args.ref, args.kind)
+    c, f = api("GET", f"/{KINDS[kind][0]}/{it['id']}")
+    ok(f"#{f['ref']} · {KINDS[kind][3]} · {p['name']}")
+    ok(f"  {f['subject']}")
+    ok(f"  статус:      {f['status_extra_info']['name']} (закрывающий: {f['status_extra_info'].get('is_closed')})")
+    ok(f"  исполнитель: {(f.get('assigned_to_extra_info') or {}).get('full_name_display') or '—'}")
+    ok(f"  создана:     {f['created_date'][:10]} · версия {f['version']}")
+    if f.get("description"): ok("\n" + f["description"])
+    c, h = api("GET", f"/history/{KINDS[kind][1]}/{it['id']}")
+    ev = [e for e in (h or []) if "status" in (e.get("values_diff") or {})]
+    if ev:
+        ok("\n  переходы:")
+        for e in reversed(ev):
+            v = e["values_diff"]["status"]
+            ok(f"    {e['created_at'][:16]}  {(e.get('user') or {}).get('name','?'):<22} {v[0]} → {v[1]}")
+
+def cmd_new(args):
+    p = project(args); pid = p["id"]; kind = args.kind or "us"
+    if kind == "epic" and not p.get("is_epics_activated"): die("модуль эпиков в проекте выключен")
+    body = {"project": pid, "subject": args.subject}
+    if kind == "task":
+        if not args.parent: die("задача не существует сама по себе — укажите --parent <номер истории>")
+        _, par = find_item(pid, args.parent, "us"); body["user_story"] = par["id"]
+    if args.assign: body["assigned_to"] = resolve_member(pid, args.assign)["user"]
+    if args.status: body["status"] = resolve_status(pid, kind, args.status)["id"]
+    c, ex = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
+    dup = [i for i in (ex or []) if i["subject"].strip().lower() == args.subject.strip().lower()]
+    if dup and not args.force: die(f"уже есть #{dup[0]['ref']} с таким названием — повторить можно с --force")
+    if not confirm(args, f"создать {KINDS[kind][3]} в «{p['name']}»: {args.subject}"): return
+    c, r = api("POST", f"/{KINDS[kind][0]}", body)
+    if c != 201: die(f"{c}: {r}")
+    ok(f"создано #{r['ref']} (id {r['id']})")
+
+def cmd_mv(args):
+    p = project(args); kind, it = find_item(p["id"], args.ref, args.kind)
+    st = resolve_status(p["id"], kind, args.status)
+    for _ in range(3):
+        c, cur = api("GET", f"/{KINDS[kind][0]}/{it['id']}")
+        if cur["status"] == st["id"]: ok(f"#{cur['ref']} уже в «{st['name']}»"); return
+        if not confirm(args, f"#{cur['ref']} «{cur['subject'][:50]}»: "
+                             f"{cur['status_extra_info']['name']} → {st['name']}"): return
+        c, r = api("PATCH", f"/{KINDS[kind][0]}/{it['id']}", {"version": cur["version"], "status": st["id"]})
+        if c == 200:
+            ok(f"#{r['ref']} → {r['status_extra_info']['name']} "
+               f"(закрыта: {r['status_extra_info'].get('is_closed')}), версия {cur['version']}→{r['version']}")
+            return
+        t = json.dumps(r, ensure_ascii=False)
+        if "doesn't match" in t: args.yes = True; continue
+        if "not valid" in t: die("дефект вызова: версия не принята")
+        die(f"{c}: {t}")
+    die("конфликт версий не разрешился за 3 попытки")
+
+def cmd_assign(args):
+    p = project(args); kind, it = find_item(p["id"], args.ref, args.kind)
+    m = resolve_member(p["id"], args.who)
+    c, cur = api("GET", f"/{KINDS[kind][0]}/{it['id']}")
+    if not confirm(args, f"#{cur['ref']} «{cur['subject'][:50]}» → {m['full_name']}"): return
+    c, r = api("PATCH", f"/{KINDS[kind][0]}/{it['id']}", {"version": cur["version"], "assigned_to": m["user"]})
+    if c != 200: die(f"{c}: {r}")
+    ok(f"#{r['ref']} назначена: {(r.get('assigned_to_extra_info') or {}).get('full_name_display')}")
+
+def cmd_comment(args):
+    p = project(args); kind, it = find_item(p["id"], args.ref, args.kind)
+    c, h = api("GET", f"/history/{KINDS[kind][1]}/{it['id']}")
+    if any((e.get("comment") or "").strip() == args.text.strip() for e in (h or [])) and not args.force:
+        die("такой комментарий уже есть — повторить можно с --force")
+    c, cur = api("GET", f"/{KINDS[kind][0]}/{it['id']}")
+    if not confirm(args, f"#{cur['ref']} комментарий: {args.text[:60]}"): return
+    c, r = api("PATCH", f"/{KINDS[kind][0]}/{it['id']}", {"version": cur["version"], "comment": args.text})
+    if c != 200: die(f"{c}: {r}")
+    ok(f"#{r['ref']} комментарий добавлен")
+
+
+# ── план: разбор ТЗ применяется файлом, а не чередой команд ──────────────────
+def load_plan(path):
+    p = pathlib.Path(path)
+    if not p.is_file(): die(f"нет файла плана {p}")
+    try: d = json.loads(p.read_text())
+    except json.JSONDecodeError as e: die(f"план не разбирается как JSON: {e}")
+    if not isinstance(d, dict): die("план должен быть объектом JSON")
+    return d
+
+def plan_walk(d):
+    """Разворачивает план в плоский список (род, предок, элемент)."""
+    out = []
+    for e in d.get("epics", []):
+        out.append(("epic", None, e))
+        for s in e.get("stories", []):
+            out.append(("us", e, s))
+            for t in s.get("tasks", []): out.append(("task", s, t))
+    for s in d.get("stories", []):
+        out.append(("us", None, s))
+        for t in s.get("tasks", []): out.append(("task", s, t))
+    return out
+
+def plan_resolve(args, d):
+    slug = args.project or d.get("project") or C.slug
+    if not slug: die("проект не задан: в плане, ключом -p или через taiga init")
+    c, p = api("GET", f"/projects/by_slug?slug={slug}")
+    if c != 200: die(f"проект «{slug}» не найден ({c})")
+    return p
+
+def plan_index(pid, kind):
+    c, items = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
+    return {i["subject"].strip().lower(): i for i in (items or [])}
+
+def plan_report(args, dry):
+    d = load_plan(args.file); p = plan_resolve(args, d); pid = p["id"]
+    if d.get("epics") and not p.get("is_epics_activated"):
+        die("в плане есть эпики, а модуль эпиков в проекте выключен")
+    idx = {k: plan_index(pid, k) for k in ("epic","us","task")}
+    rows, n_new = [], 0
+    for kind, parent, item in plan_walk(d):
+        subj = (item.get("subject") or "").strip()
+        if not subj: die("в плане есть элемент без subject")
+        have = idx[kind].get(subj.lower())
+        rows.append((kind, parent, item, have))
+        if not have: n_new += 1
+    ok(f"проект: {p['name']} ({p['slug']}, id {pid})")
+    ok(f"в плане: {len(rows)}, из них новых: {n_new}, уже есть: {len(rows)-n_new}\n")
+    for kind, parent, item, have in rows:
+        pad = {"epic":"", "us":"  ", "task":"    "}[kind]
+        mark = f"есть #{have['ref']}" if have else "создать"
+        ok(f"{pad}[{mark:<10}] {KINDS[kind][3]}: {item['subject'][:58]}")
+    return d, p, rows, n_new
+
+def cmd_plan(args): plan_report(args, dry=True); ok("\n(сухой прогон — ничего не записано)")
+
+def cmd_apply(args):
+    d, p, rows, n_new = plan_report(args, dry=False)
+    if n_new == 0: ok("\nсоздавать нечего — всё уже на месте"); return
+    if not confirm(args, f"\nсоздать {n_new} единиц в «{p['name']}»"): return
+    pid = p["id"]; made = {}; created = skipped = failed = 0
+    for kind, parent, item, have in rows:
+        key = (kind, item["subject"].strip().lower())
+        if have: made[key] = have; skipped += 1; continue
+        body = {"project": pid, "subject": item["subject"]}
+        if item.get("description"): body["description"] = item["description"]
+        if item.get("assign"):
+            body["assigned_to"] = resolve_member(pid, item["assign"])["user"]
+        if item.get("status"):
+            body["status"] = resolve_status(pid, kind, item["status"])["id"]
+        if kind == "task":
+            par = made.get(("us", (parent or {}).get("subject","").strip().lower()))
+            if not par: ok(f"  ! задача «{item['subject'][:40]}»: родительская история не создана"); failed += 1; continue
+            body["user_story"] = par["id"]
+        c, r = api("POST", f"/{KINDS[kind][0]}", body)
+        if c != 201: ok(f"  ! {item['subject'][:44]} → {c} {r}"); failed += 1; continue
+        made[key] = r; created += 1
+        ok(f"  #{r['ref']:<5} {KINDS[kind][3]}: {item['subject'][:52]}")
+        # привязка истории к эпику отдельным вызовом: поля в теле создания нет
+        if kind == "us" and parent:
+            ep = made.get(("epic", parent.get("subject","").strip().lower()))
+            if ep:
+                c2, r2 = api("POST", f"/epics/{ep['id']}/related_userstories",
+                             {"epic": ep["id"], "user_story": r["id"]})
+                if c2 not in (200, 201): ok(f"        ! связь с эпиком → {c2}")
+    ok(f"\nсоздано {created}, пропущено {skipped}, отказов {failed}")
+
+def main():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-p","--project", help="слаг проекта (иначе из .claude/tracker.local.md)")
+    common.add_argument("-y","--yes", action="store_true", help="не спрашивать подтверждения")
+    common.add_argument("--kind", choices=list(KINDS), help="род единицы работы")
+    ap = argparse.ArgumentParser(prog="taiga", description="работа с трекером Taiga из папки проекта")
+    sub = ap.add_subparsers(dest="cmd", required=True); P = lambda n: sub.add_parser(n, parents=[common])
+    lg = P("login"); lg.add_argument("--here", action="store_true", help="токен в .taiga/ этого проекта"); lg.set_defaults(fn=cmd_login)
+    P("refresh").set_defaults(fn=cmd_refresh); P("status").set_defaults(fn=cmd_status); P("projects").set_defaults(fn=cmd_projects)
+    i = P("init"); i.add_argument("slug"); i.add_argument("--name"); i.add_argument("--here", action="store_true"); i.add_argument("--force", action="store_true"); i.set_defaults(fn=cmd_init)
+    l = P("ls"); l.add_argument("--open", action="store_true"); l.add_argument("--mine", action="store_true"); l.add_argument("--status"); l.set_defaults(fn=cmd_ls)
+    s = P("show"); s.add_argument("ref"); s.set_defaults(fn=cmd_show)
+    n = P("new"); n.add_argument("subject"); n.add_argument("--parent"); n.add_argument("--assign"); n.add_argument("--status"); n.add_argument("--force", action="store_true"); n.set_defaults(fn=cmd_new)
+    m = P("mv"); m.add_argument("ref"); m.add_argument("status"); m.set_defaults(fn=cmd_mv)
+    a = P("assign"); a.add_argument("ref"); a.add_argument("who"); a.set_defaults(fn=cmd_assign)
+    pl = P("plan"); pl.add_argument("file"); pl.set_defaults(fn=cmd_plan)
+    apl = P("apply"); apl.add_argument("file"); apl.set_defaults(fn=cmd_apply)
+    cm = P("comment"); cm.add_argument("ref"); cm.add_argument("text"); cm.add_argument("--force", action="store_true"); cm.set_defaults(fn=cmd_comment)
+    args = ap.parse_args(); args.fn(args)
+
+if __name__ == "__main__":
+    try: main()
+    except KeyboardInterrupt: sys.exit(130)
