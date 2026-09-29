@@ -245,7 +245,13 @@ refresh_file: {rf}
 def cmd_ls(args):
     p = project(args); kind = args.kind or "us"
     c, items = api("GET", f"/{KINDS[kind][0]}?project={p['id']}", nopage=True); items = items or []
-    if args.open: items = [i for i in items if not i["is_closed"]]
+    # Признак закрытости берётся из КАТАЛОГА статусов, а не из поля объекта:
+    # Taiga дублирует is_closed на объект и не пересчитывает его при правке каталога
+    # или возврате карточки — проверено, 5.5% объектов инстанса расходятся.
+    c, st = api("GET", f"/{KINDS[kind][2]}?project={p['id']}")
+    closed_ids = {s["id"] for s in (st or []) if s.get("is_closed")}
+    is_closed = lambda i: i["status"] in closed_ids
+    if args.open: items = [i for i in items if not is_closed(i)]
     if args.mine: items = [i for i in items if i.get("assigned_to") == IDENTITY["id"]]
     if args.status: items = [i for i in items if args.status.lower() in
                              (i.get("status_extra_info") or {}).get("name","").lower()]
