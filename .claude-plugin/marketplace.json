@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "taiga-kit",
+  "description": "Свои инструменты для трекера Taiga",
+  "owner": { "name": "Evgenij Karnakov", "email": "ekarnakov@megacam.kz" },
+  "plugins": [
+    {
+      "name": "taiga-kit",
+      "description": "Работа с трекером Taiga через собственный CLI: чтение, создание, перевод статусов, разбор технического задания в эпики и истории. Поведение API проверено вызовами на живом инстансе.",
+      "source": "./",
+      "author": { "name": "Evgenij Karnakov", "email": "ekarnakov@megacam.kz" }
+    }
+  ]
+}
