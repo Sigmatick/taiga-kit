@@ -421,6 +421,149 @@ def cmd_apply(args):
                 if c2 not in (200, 201): ok(f"        ! связь с эпиком → {c2}")
     ok(f"\nсоздано {created}, пропущено {skipped}, отказов {failed}")
 
+
+# ── создание проекта ─────────────────────────────────────────────────────────
+# Слаг назначает трекер транслитерацией имени — предугадать нельзя, берём из ответа.
+# У нового проекта эпики и канбан ВЫКЛЮЧЕНЫ, остальные модули включены. Создание
+# в выключенном модуле отвечает 201, поэтому модули включаются ДО единиц работы.
+# У проекта нет поля version — правка идёт без цикла с версией.
+def copy_columns(pid, sample_slug):
+    """Перенос колонок канбана = каталога статусов историй из проекта-образца."""
+    c, sp = api("GET", f"/projects/by_slug?slug={sample_slug}")
+    if c != 200: die(f"образец «{sample_slug}» не найден ({c})")
+    c, src = api("GET", f"/userstory-statuses?project={sp['id']}")
+    c, dst = api("GET", f"/userstory-statuses?project={pid}")
+    src, dst = src or [], dst or []
+    want = {s["name"]: s for s in src}
+    have = {s["name"]: s for s in dst}
+    made = 0
+    for name, s in want.items():                       # сначала создать недостающие
+        if name in have: continue
+        body = {"project": pid, "name": name, "order": s.get("order", 1),
+                "is_closed": s.get("is_closed", False), "is_archived": s.get("is_archived", False)}
+        if s.get("color"): body["color"] = s["color"]
+        c, r = api("POST", "/userstory-statuses", body)
+        if c == 201: have[name] = r; made += 1
+        else: ok(f"    ! статус «{name}» → {c} {r}")
+    keep = next(iter(have[n]["id"] for n in want if n in have), None)
+    if keep is None: die("не удалось создать ни одного статуса образца")
+    for name, s in list(have.items()):                 # затем выровнять оставшиеся
+        if name in want:
+            w = want[name]
+            if s.get("order") != w.get("order") or s.get("is_closed") != w.get("is_closed"):
+                api("PATCH", f"/userstory-statuses/{s['id']}",
+                    {"order": w.get("order", 1), "is_closed": w.get("is_closed", False)})
+        else:
+            # moveTo обязателен даже в пустом проекте — без него 400
+            c, r = api("DELETE", f"/userstory-statuses/{s['id']}?moveTo={keep}")
+            if c not in (204, 200): ok(f"    ! удаление «{name}» → {c} {r}")
+    c, final = api("GET", f"/userstory-statuses?project={pid}")
+    return made, [s["name"] for s in sorted(final or [], key=lambda x: x.get("order", 0))]
+
+
+def cmd_users(args):
+    """Люди инстанса или участники проекта."""
+    if args.project or C.slug:
+        p = project(args)
+        c, ms = api("GET", f"/memberships?project={p['id']}")
+        ok(f"участники «{p['name']}»:")
+        for m in sorted(ms or [], key=lambda x: (x.get("full_name") or "")):
+            mark = "" if m.get("user") else "   ← приглашение, назначить нельзя"
+            ok(f"  {(m.get('full_name') or m.get('email')):<26} роль: {m.get('role_name','—'):<16}{mark}")
+        c, roles = api("GET", f"/roles?project={p['id']}")
+        ok("\nроли проекта: " + ", ".join(r["name"] for r in (roles or [])))
+    else:
+        c, us = api("GET", "/users")
+        ok(f"люди инстанса ({len(us or [])}):")
+        for u in sorted(us or [], key=lambda x: (x.get("full_name_display") or "")):
+            ok(f"  {u.get('full_name_display'):<26} @{u.get('username'):<18} активен: {u.get('is_active')}")
+
+def add_members(pid, names, role_name, args):
+    """Добавление участников. Успешный ответ означает, что письмо УЖЕ ушло."""
+    c, roles = api("GET", f"/roles?project={pid}")
+    roles = roles or []
+    hit = [r for r in roles if r["name"].lower() == (role_name or "").lower()] or \
+          [r for r in roles if (role_name or "").lower() in r["name"].lower()]
+    if not hit: die(f"роль «{role_name}» не найдена. Есть: " + ", ".join(r["name"] for r in roles))
+    if len(hit) > 1: die("подходят несколько ролей: " + ", ".join(r["name"] for r in hit))
+    role = hit[0]
+    c, all_users = api("GET", "/users")
+    picked = []
+    for name in names:
+        m = [u for u in (all_users or [])
+             if name.lower() in (u.get("full_name_display") or "").lower()
+             or name.lower() == (u.get("username") or "").lower()]
+        if not m: die(f"«{name}» не найден среди людей инстанса — см. `taiga users`")
+        if len(m) > 1: die(f"«{name}» подходит нескольким: " + ", ".join(x["full_name_display"] for x in m))
+        picked.append(m[0])
+    ok(f"\nдобавить в проект с ролью «{role['name']}»:")
+    for u in picked: ok(f"  {u['full_name_display']} (@{u['username']})")
+    ok("  ВНИМАНИЕ: каждому уйдёт письмо-уведомление. Это действие за пределами трекера.")
+    if not confirm(args, ""): ok("участники не добавлены"); return 0
+    n = 0
+    for u in picked:
+        # username, а не email: по адресу незарегистрированного создаётся приглашение с user=null
+        c, r = api("POST", "/memberships",
+                   {"project": pid, "role": role["id"], "username": u["username"]})
+        if c == 201: n += 1; ok(f"  добавлен: {u['full_name_display']}")
+        else: ok(f"  ! {u['full_name_display']} → {c} {r}")
+    return n
+
+def cmd_new_project(args):
+    auth()
+    if not args.desc: die("описание обязательно: Taiga отвечает 400 без него")
+    if args.duplicate and args.sample: die("--duplicate и --sample вместе не имеют смысла")
+    mods = [m.strip() for m in (args.modules or "epics,kanban").split(",") if m.strip()]
+    ok(f"создать проект «{args.name}»")
+    ok(f"  описание: {args.desc}")
+    ok(f"  доступ:   {'приватный' if not args.public else 'публичный'}")
+    ok(f"  включить: {', '.join(mods) or '—'}")
+    if args.duplicate:
+        ok(f"  способ:   ДУБЛИКАТ проекта «{args.duplicate}»")
+        ok(f"            переносятся все четыре каталога статусов, роли, произвольные поля")
+        ok(f"            НЕ переносятся: спринты, единицы работы, участники")
+        ok(f"            состояние модулей берётся от образца — выключенные останутся выключенными")
+    elif args.sample: ok(f"  колонки:  перенести из «{args.sample}» (только статусы историй)")
+    if args.init:   ok(f"  подключить текущую папку: {pathlib.Path.cwd()}")
+    if not confirm(args, ""): return
+
+    if args.duplicate:
+        c, sp = api("GET", f"/projects/by_slug?slug={args.duplicate}")
+        if c != 200: die(f"образец «{args.duplicate}» не найден ({c})")
+        c, p = api("POST", f"/projects/{sp['id']}/duplicate",
+                   {"name": args.name, "description": args.desc,
+                    "is_private": not args.public, "users": []})
+    else:
+        c, p = api("POST", "/projects", {"name": args.name, "description": args.desc,
+                                         "is_private": not args.public})
+    if c != 201: die(f"создание отклонено {c}: {p}")
+    pid, slug = p["id"], p["slug"]
+    ok(f"\nсоздан: «{p['name']}» id={pid} слаг={slug}")   # слаг из ответа, не угаданный
+
+    if mods:
+        body = {f"is_{m}_activated": True for m in mods}
+        c, r = api("PATCH", f"/projects/{pid}", body)      # у проекта нет version
+        if c != 200: ok(f"  ! включение модулей → {c} {r}")
+        c, chk = api("GET", f"/projects/{pid}")
+        for m in mods:
+            key = f"is_{m}_activated"
+            if key not in chk: ok(f"  ! модуля {m} не существует")
+            elif not chk[key]: ok(f"  ! модуль {m} НЕ включился")
+            else: ok(f"  модуль {m}: включён")
+
+    if args.sample and not args.duplicate:
+        made, names = copy_columns(pid, args.sample)
+        ok(f"  колонки перенесены (создано {made}): {', '.join(names)}")
+
+    if args.users:
+        add_members(pid, [x.strip() for x in args.users.split(",") if x.strip()], args.role, args)
+
+    if args.init:
+        ns = argparse.Namespace(slug=slug, name=None, here=False, force=True,
+                                project=None, yes=True, kind=None)
+        cmd_init(ns)
+    ok(f"\nготово. Дальше: taiga init {slug}  —  в папке проекта")
+
 def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-p","--project", help="слаг проекта (иначе из .claude/tracker.local.md)")
@@ -436,6 +579,16 @@ def main():
     n = P("new"); n.add_argument("subject"); n.add_argument("--parent"); n.add_argument("--assign"); n.add_argument("--status"); n.add_argument("--force", action="store_true"); n.set_defaults(fn=cmd_new)
     m = P("mv"); m.add_argument("ref"); m.add_argument("status"); m.set_defaults(fn=cmd_mv)
     a = P("assign"); a.add_argument("ref"); a.add_argument("who"); a.set_defaults(fn=cmd_assign)
+    np = P("new-project"); np.add_argument("name"); np.add_argument("--desc", required=True)
+    np.add_argument("--public", action="store_true")
+    np.add_argument("--sample", help="перенести колонки канбана из этого проекта")
+    np.add_argument("--duplicate", help="создать дубликатом этого проекта: каталоги, роли,\nпроизвольные поля; спринты, задачи и участники НЕ копируются")
+    np.add_argument("--modules", help="через запятую, по умолчанию epics,kanban")
+    np.add_argument("--init", action="store_true", help="сразу подключить текущую папку")
+    np.add_argument("--users", help="кого добавить, через запятую (отдельное подтверждение: уйдут письма)")
+    np.add_argument("--role", help="роль добавляемых участников")
+    np.set_defaults(fn=cmd_new_project)
+    P("users").set_defaults(fn=cmd_users)
     pl = P("plan"); pl.add_argument("file"); pl.set_defaults(fn=cmd_plan)
     apl = P("apply"); apl.add_argument("file"); apl.set_defaults(fn=cmd_apply)
     cm = P("comment"); cm.add_argument("ref"); cm.add_argument("text"); cm.add_argument("--force", action="store_true"); cm.set_defaults(fn=cmd_comment)
