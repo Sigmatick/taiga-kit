@@ -488,6 +488,15 @@ def add_members(pid, names, role_name, args):
     if len(hit) > 1: die("подходят несколько ролей: " + ", ".join(r["name"] for r in hit))
     role = hit[0]
     c, all_users = api("GET", "/users")
+    # /users почту не отдаёт — только id и username. Почта есть в memberships проектов,
+    # а она нужна: по логину Taiga требует, чтобы человек был «контактом».
+    emails = {}
+    c, projs = api("GET", "/projects")
+    for pr in (projs or []):
+        c, ms = api("GET", f"/memberships?project={pr['id']}")
+        for m in (ms or []):
+            if m.get("user") and (m.get("user_email") or m.get("email")):
+                emails.setdefault(m["user"], m.get("user_email") or m.get("email"))
     picked = []
     for name in names:
         m = [u for u in (all_users or [])
@@ -495,18 +504,33 @@ def add_members(pid, names, role_name, args):
              or name.lower() == (u.get("username") or "").lower()]
         if not m: die(f"«{name}» не найден среди людей инстанса — см. `taiga users`")
         if len(m) > 1: die(f"«{name}» подходит нескольким: " + ", ".join(x["full_name_display"] for x in m))
-        picked.append(m[0])
+        u = dict(m[0]); u["email"] = emails.get(u["id"])
+        if not u["email"]:
+            ok(f"  ! почта для «{u['full_name_display']}» не найдена — пойдём по логину, "
+               f"он сработает только если человек делит с вами проект")
+        picked.append(u)
     ok(f"\nдобавить в проект с ролью «{role['name']}»:")
     for u in picked: ok(f"  {u['full_name_display']} (@{u['username']})")
     ok("  ВНИМАНИЕ: каждому уйдёт письмо-уведомление. Это действие за пределами трекера.")
     if not confirm(args, ""): ok("участники не добавлены"); return 0
     n = 0
     for u in picked:
-        # username, а не email: по адресу незарегистрированного создаётся приглашение с user=null
-        c, r = api("POST", "/memberships",
-                   {"project": pid, "role": role["id"], "username": u["username"]})
-        if c == 201: n += 1; ok(f"  добавлен: {u['full_name_display']}")
-        else: ok(f"  ! {u['full_name_display']} → {c} {r}")
+        # Поле называется username, но принимает и логин, и почту — и ведут они себя РАЗНО.
+        # По логину Taiga требует, чтобы человек был «контактом» (делил с вами проект),
+        # иначе 400 «The user must be a valid contact». По почте эта проверка не срабатывает.
+        # Поэтому сначала почта, логин — запасной путь. Проверено на живом инстансе.
+        r = None
+        for ident in [x for x in (u.get("email"), u.get("username")) if x]:
+            c, r = api("POST", "/memberships",
+                       {"project": pid, "role": role["id"], "username": ident})
+            if c == 201: break
+        if r and isinstance(r, dict) and r.get("id") and r.get("user"):
+            n += 1; ok(f"  добавлен: {u['full_name_display']} (user={r['user']})")
+        elif r and isinstance(r, dict) and r.get("id"):
+            ok(f"  ! {u['full_name_display']}: создано ПРИГЛАШЕНИЕ (user пустой) — "
+               f"назначить на него задачу нельзя, пока не примет")
+        else:
+            ok(f"  ! {u['full_name_display']} → {r}")
     return n
 
 def cmd_new_project(args):
