@@ -588,6 +588,81 @@ def cmd_new_project(args):
         cmd_init(ns)
     ok(f"\nготово. Дальше: taiga init {slug}  —  в папке проекта")
 
+
+# ── синхронизация статусов история ← задачи ──────────────────────────────────
+# Taiga этого не делает: у историй и задач РАЗНЫЕ каталоги статусов, и закрытие
+# всех задач не двигает историю. Правило строится на признаке is_closed и порядке
+# order, а не на названиях: на одном инстансе схемы каталогов могут различаться.
+def _status_scale(statuses):
+    """Упорядоченный список статусов и индекс по id — для сравнения «дальше/раньше»."""
+    srt = sorted(statuses, key=lambda s: (s.get("order", 0), s["id"]))
+    return srt, {s["id"]: i for i, s in enumerate(srt)}
+
+def plan_sync(pid):
+    """Для каждой истории с задачами — какой статус ей полагается по задачам."""
+    c, us_st = api("GET", f"/userstory-statuses?project={pid}")
+    c, tk_st = api("GET", f"/task-statuses?project={pid}")
+    us_srt, us_idx = _status_scale(us_st or [])
+    tk_closed = {s["id"] for s in (tk_st or []) if s.get("is_closed")}
+    tk_first = _status_scale(tk_st or [])[0][0]["id"] if tk_st else None
+
+    us_done = next((s for s in us_srt if s.get("is_closed")), None)
+    # «в работе» ищем по имени (оно совпадает в обеих схемах), иначе — середина шкалы
+    us_prog = next((s for s in us_srt if "progress" in s["name"].lower()), None) \
+              or (us_srt[len(us_srt)//2] if us_srt else None)
+    if not us_done or not us_prog: die("в проекте нет закрывающего или рабочего статуса историй")
+
+    c, uss = api("GET", f"/userstories?project={pid}", nopage=True)
+    c, tks = api("GET", f"/tasks?project={pid}", nopage=True)
+    by = {}
+    for t in (tks or []):
+        if t.get("user_story"): by.setdefault(t["user_story"], []).append(t)
+
+    rows = []
+    for u in (uss or []):
+        kids = by.get(u["id"])
+        if not kids: continue                     # истории без задач не трогаем
+        closed = [k for k in kids if k["status"] in tk_closed]
+        started = [k for k in kids if k["status"] not in tk_closed and k["status"] != tk_first]
+        if len(closed) == len(kids):   want = us_done
+        elif closed or started:        want = us_prog
+        else:                          continue   # все задачи в начальном — нечего менять
+        cur_i = us_idx.get(u["status"], -1); want_i = us_idx.get(want["id"], -1)
+        if cur_i >= want_i: continue              # только вперёд: назад не откатываем
+        rows.append({"us": u, "want": want, "kids": len(kids), "closed": len(closed),
+                     "from": (u.get("status_extra_info") or {}).get("name", "?")})
+    return rows
+
+def cmd_sync(args):
+    p = project(args); rows = plan_sync(p["id"])
+    if args.ref:
+        r = int(re.sub(r"\D", "", str(args.ref)))
+        rows = [x for x in rows if x["us"]["ref"] == r]
+    ok(f"{p['name']}: историй к переводу — {len(rows)}")
+    if not rows:
+        ok("расхождений нет (истории без задач и откаты назад не учитываются)"); return
+    for x in rows:
+        ok(f"  #{x['us']['ref']:<5} {x['us']['subject'][:46]:<48} "
+           f"{x['from']} → {x['want']['name']}   (задач {x['closed']}/{x['kids']} закрыто)")
+    if args.dry: ok("\n(сухой прогон — ничего не записано)"); return
+    if not confirm(args, f"\nперевести {len(rows)} историй"): return
+    done = fail = 0
+    for x in rows:
+        uid = x["us"]["id"]
+        for _ in range(3):
+            c, cur = api("GET", f"/userstories/{uid}")
+            if c != 200: fail += 1; break
+            c, r = api("PATCH", f"/userstories/{uid}",
+                       {"version": cur["version"], "status": x["want"]["id"]})
+            if c == 200:
+                done += 1
+                ok(f"  #{r['ref']} → {r['status_extra_info']['name']} "
+                   f"(закрыта: {r['status_extra_info'].get('is_closed')})")
+                break
+            if "doesn't match" in json.dumps(r, ensure_ascii=False): continue
+            ok(f"  ! #{x['us']['ref']} → {c} {r}"); fail += 1; break
+    ok(f"\nпереведено {done}, отказов {fail}")
+
 def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-p","--project", help="слаг проекта (иначе из .claude/tracker.local.md)")
@@ -613,6 +688,9 @@ def main():
     np.add_argument("--role", help="роль добавляемых участников")
     np.set_defaults(fn=cmd_new_project)
     P("users").set_defaults(fn=cmd_users)
+    sy = P("sync"); sy.add_argument("--ref", help="только одна история")
+    sy.add_argument("--dry", action="store_true", help="только показать расхождения")
+    sy.set_defaults(fn=cmd_sync)
     pl = P("plan"); pl.add_argument("file"); pl.set_defaults(fn=cmd_plan)
     apl = P("apply"); apl.add_argument("file"); apl.set_defaults(fn=cmd_apply)
     cm = P("comment"); cm.add_argument("ref"); cm.add_argument("text"); cm.add_argument("--force", action="store_true"); cm.set_defaults(fn=cmd_comment)
