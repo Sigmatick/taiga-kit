@@ -270,13 +270,37 @@ def cmd_show(args):
     ok(f"  исполнитель: {(f.get('assigned_to_extra_info') or {}).get('full_name_display') or '—'}")
     ok(f"  создана:     {f['created_date'][:10]} · версия {f['version']}")
     if f.get("description"): ok("\n" + f["description"])
+    c, att = api("GET", f"/{KINDS[kind][0]}/attachments?object_id={it['id']}&project={p['id']}")
+    live = [a for a in (att or []) if not a.get("is_deprecated")]
+    if live:
+        ok("\n  вложения:")
+        for a in live:
+            ok(f"    {a.get('created_date','')[:16]}  {a.get('name')}  {a.get('url') or ''}")
     c, h = api("GET", f"/history/{KINDS[kind][1]}/{it['id']}")
-    ev = [e for e in (h or []) if "status" in (e.get("values_diff") or {})]
+    ev = [e for e in (h or []) if e.get("values_diff") or
+          ((e.get("comment") or "").strip() and not e.get("delete_comment_date"))]
     if ev:
-        ok("\n  переходы:")
-        for e in reversed(ev):
-            v = e["values_diff"]["status"]
-            ok(f"    {e['created_at'][:16]}  {(e.get('user') or {}).get('name','?'):<22} {v[0]} → {v[1]}")
+        ok("\n  история:")
+        for e in sorted(ev, key=lambda x: x["created_at"]):
+            who = (e.get("user") or {}).get("name", "?")
+            head = f"    {e['created_at'][:16]}  {who:<22}"
+            vd = e.get("values_diff") or {}
+            if "status" in vd:
+                ok(f"{head} статус: {vd['status'][0]} → {vd['status'][1]}")
+            for a in (vd.get("attachments") or {}).get("new", []):
+                ok(f"{head} вложение: {a.get('filename') or a.get('name')}")
+            other = [k for k in vd if k not in ("status", "attachments")]
+            if other:
+                ok(f"{head} изменено: {', '.join(other)}")
+            if "description_diff" in vd and vd.get("description"):
+                old, new = vd["description"]
+                ok(f"      было:  {(old or '').strip()[:400]}")
+                ok(f"      стало: {(new or '').strip()[:400]}")
+            text = (e.get("comment") or "").strip()
+            if text and not e.get("delete_comment_date"):
+                ok(f"{head} комментарий:")
+                for line in text.splitlines():
+                    ok(f"      {line}")
 
 def cmd_new(args):
     p = project(args); pid = p["id"]; kind = args.kind or "us"
