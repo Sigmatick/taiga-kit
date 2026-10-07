@@ -228,6 +228,8 @@ taiga sync [--dry] [--ref N]   подтянуть статус истории п
 taiga triage [--days N] [--all] [--comment]
                           проверить оформление нового: что нельзя взять в работу
 
+taiga registry [--scan] [--forget <слаг>]
+                          реестр «слаг → папка с кодом», ~/.taiga-kit/projects.json
 taiga users [-p <слаг>]    люди инстанса или участники проекта и его роли
 taiga new-project "Имя" --desc "описание"
        [--duplicate <слаг>]   копия устройства проекта: каталоги, роли, поля

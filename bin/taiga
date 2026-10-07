@@ -41,7 +41,7 @@ class Conf:
         if key("token_file"):                      # url кладём рядом с токеном
             self.url_f = self.tok_f.with_name(self.tok_f.name.replace("token","url")) \
                          if "token" in self.tok_f.name else self.root/".taiga"/"url"
-        m = re.search(r"^\|\s*([a-z0-9][a-z0-9._-]*)\s*\|", txt, re.M)
+        m = re.search(r"^\|\s*([a-z0-9][a-z0-9._-]*)\b", txt, re.M)
         self.slug = m.group(1) if m else None
     def _resolve(self, v):
         p = pathlib.Path(os.path.expanduser(v))
@@ -76,6 +76,87 @@ def guard_gitignore(d: pathlib.Path):
     if line not in cur.split():
         gi.write_text(cur + ("" if cur.endswith("\n") or not cur else "\n") + line + "\n")
         ok(f"в {gi} дописано «{line}»")
+
+
+# ── реестр проектов: слаг → папка с кодом ───────────────────────────────────
+# Связь .claude/tracker.local.md односторонняя: папка знает свой проект, а по
+# слагу найти папку нельзя. Дозорному и разведке нужна обратная: реестр машинный,
+# у каждого свой, заполняется при taiga init.
+REG = HOME / ".taiga-kit" / "projects.json"
+
+def reg_load():
+    if not REG.is_file(): return {}
+    try: d = json.loads(REG.read_text())
+    except json.JSONDecodeError: return {}
+    return d if isinstance(d, dict) else {}
+
+def reg_save(d):
+    REG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = REG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    tmp.replace(REG)
+
+def reg_put(slug, path, base_url):
+    d = reg_load()
+    d[slug] = {"path": str(pathlib.Path(path).resolve()),
+               "base_url": base_url,
+               "updated": __import__("datetime").date.today().isoformat()}
+    reg_save(d); return d[slug]
+
+def reg_path(slug):
+    """Папка проекта или None. Исчезнувшие каталоги не возвращаются."""
+    e = reg_load().get(slug)
+    if not e: return None
+    p = pathlib.Path(e["path"] if isinstance(e, dict) else e)
+    return p if p.is_dir() else None
+
+def reg_scan(roots):
+    """Обход дерева в поисках .claude/tracker.local.md — для уже подключённых
+    проектов, которые заводили до появления реестра."""
+    found = []
+    for root in roots:
+        r = pathlib.Path(os.path.expanduser(root))
+        if not r.is_dir(): continue
+        for cfg in r.glob("*/**/.claude/tracker.local.md"):
+            if any(part in (".git", "node_modules", "Pods", ".build") for part in cfg.parts): continue
+            txt = cfg.read_text(errors="ignore")
+            m = re.search(r"^\|\s*([a-z0-9][a-z0-9._-]*)\b", txt, re.M)
+            u = re.search(r"^base_url:\s*(\S+)\s*$", txt.split("---")[1] if txt.startswith("---") else "", re.M)
+            if m: found.append((m.group(1), cfg.parent.parent, u.group(1) if u else ""))
+    return found
+
+def cmd_registry(args):
+    if args.scan is not None:
+        roots = [args.scan] if args.scan else ["~/Development", "~/Documents", "~/Projects", "~/code"]
+        ok("ищу подключённые проекты в: " + ", ".join(roots))
+        found = reg_scan(roots)
+        if not found: ok("ничего не найдено"); return
+        d = reg_load(); n = 0
+        for slug, path, url in found:
+            was = d.get(slug)
+            was_path = (was or {}).get("path") if isinstance(was, dict) else was
+            if was_path == str(path.resolve()): ok(f"  уже в реестре: {slug}"); continue
+            if was_path: ok(f"  ! {slug}: был {was_path}, стал {path}")
+            reg_put(slug, path, url or base()); n += 1
+            ok(f"  добавлен: {slug:<16} {path}")
+        ok(f"\nзаписано: {n}")
+        return
+    d = reg_load()
+    if args.forget:
+        if args.forget not in d: die(f"«{args.forget}» в реестре нет")
+        del d[args.forget]; reg_save(d); ok(f"удалено: {args.forget}"); return
+    if not d: ok(f"реестр пуст ({REG})"); ok("заполняется сам при `taiga init <слаг>` в папке проекта"); return
+    ok(f"реестр: {REG}\n")
+    gone = []
+    for slug in sorted(d):
+        e = d[slug]; p = e["path"] if isinstance(e, dict) else e
+        live = pathlib.Path(p).is_dir()
+        if not live: gone.append(slug)
+        cfg = (pathlib.Path(p) / ".claude" / "tracker.local.md").is_file() if live else False
+        mark = "" if live and cfg else ("  ← папки нет" if not live else "  ← конфиг трекера пропал")
+        ok(f"  {slug:<16} {p}{mark}")
+    if gone:
+        ok(f"\nисчезло папок: {len(gone)}. Убрать: taiga registry --forget <слаг>")
 
 # ── транспорт ────────────────────────────────────────────────────────────────
 def raw(method, path, body=None, token=None, nopage=False):
@@ -240,6 +321,8 @@ refresh_file: {rf}
 """)
     ok(f"подключено: {f}")
     ok(f"проект «{p['name']}» (слаг {p['slug']}, id {p['id']})")
+    reg_put(p["slug"], pathlib.Path.cwd(), base())
+    ok(f"в реестре: {REG}")
     if args.here: ok("токен ожидается в .taiga/ — выполните `taiga login --here` здесь же")
 
 def cmd_ls(args):
@@ -782,6 +865,10 @@ def main():
     np.add_argument("--role", help="роль добавляемых участников")
     np.set_defaults(fn=cmd_new_project)
     P("users").set_defaults(fn=cmd_users)
+    rg = P("registry"); rg.add_argument("--forget", metavar="СЛАГ", help="убрать проект из реестра")
+    rg.add_argument("--scan", nargs="?", const="", metavar="ПУТЬ",
+                    help="найти уже подключённые проекты и внести в реестр")
+    rg.set_defaults(fn=cmd_registry)
     tr = P("triage"); tr.add_argument("--days", default="1", help="за сколько суток, по умолчанию 1")
     tr.add_argument("--comment", action="store_true", help="оставить замечания комментарием в трекере")
     tr.add_argument("--all", action="store_true", help="по всем доступным проектам")
