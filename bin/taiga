@@ -840,6 +840,196 @@ def _triage_one(args):
         else: ok(f"  ! #{o['ref']} → {c}")
     ok(f"\nпрокомментировано {n}")
 
+
+# ── дозорный: опрос Тайги и заготовки триажа в папках проектов ──────────────
+STATE = HOME / ".taiga-kit" / "watch-state.json"
+WEB_PATH = {"us": "us", "task": "task", "issue": "issue", "epic": "epic"}
+
+def state_load():
+    if not STATE.is_file(): return {}
+    try: return json.loads(STATE.read_text())
+    except json.JSONDecodeError: return {}
+
+def state_save(d):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    t = STATE.with_suffix(".tmp"); t.write_text(json.dumps(d, ensure_ascii=False, indent=2)); t.replace(STATE)
+
+def _slugify(s, n=40):
+    s = re.sub(r"[^\w\s-]", "", s, flags=re.U).strip().lower()
+    return re.sub(r"[\s_]+", "-", s)[:n].strip("-") or "без-названия"
+
+def notify(title, text):
+    """Уведомление macOS. На других системах молча пропускаем."""
+    if sys.platform != "darwin": return
+    try:
+        esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
+        subprocess.run(["osascript", "-e",
+                        f'display notification "{esc(text)}" with title "{esc(title)}"'],
+                       capture_output=True, timeout=10)
+    except Exception: pass
+
+def stub_text(slug, pname, kind, o, full, flags, base_url):
+    import datetime
+    url = f"{base_url}/project/{slug}/{WEB_PATH[kind]}/{o['ref']}"
+    who = (o.get("assigned_to_extra_info") or {}).get("full_name_display") or "не назначена"
+    st = (o.get("status_extra_info") or {}).get("name", "?")
+    desc = (full.get("description") or "").strip() or "_описания в тикете нет_"
+    gaps = "\n".join(f"- {x}" for x in flags) if flags else "_замечаний нет_"
+    return f"""---
+тикет: {pname} #{o['ref']}
+слаг: {slug}
+род: {KINDS[kind][3]}
+статус: ждёт разведки
+создан: {datetime.date.today().isoformat()}
+---
+
+# {o['subject']}
+
+{url}
+
+статус в трекере: {st} · исполнитель: {who}
+
+## Что в тикете
+
+{desc}
+
+## Чего не хватает в тикете
+
+{gaps}
+
+## Что нашлось в коде
+
+_не заполнено. В сессии с этой папкой скажите: разбери {o['ref']}_
+
+## Гипотеза
+
+_не заполнено_
+
+## Что предлагаю
+
+_не заполнено_
+"""
+
+
+LAUNCH_LABEL = "kz.taiga-kit.watch"
+
+def watch_install(args):
+    """Расписание дозорного. macOS — launchd; на другом — подсказка для cron."""
+    exe = str((pathlib.Path(sys.argv[0]).resolve()))
+    if sys.platform != "darwin":
+        ok("автоустановка расписания есть только для macOS. Для cron добавьте строку:")
+        ok(f"  0 9-19 * * 1-5  {exe} watch >> ~/.taiga-kit/watch.log 2>&1")
+        return
+    plist = HOME / "Library" / "LaunchAgents" / f"{LAUNCH_LABEL}.plist"
+    if args.uninstall:
+        subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+        if plist.exists(): plist.unlink()
+        ok(f"расписание снято: {plist}"); return
+    hours = "".join(
+        f"    <dict><key>Weekday</key><integer>{d}</integer>"
+        f"<key>Hour</key><integer>{h}</integer><key>Minute</key><integer>5</integer></dict>\n"
+        for d in range(1, 6) for h in range(9, 20))
+    log = HOME / ".taiga-kit"
+    log.mkdir(parents=True, exist_ok=True)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LAUNCH_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{exe}</string><string>watch</string></array>
+  <key>StartCalendarInterval</key>
+  <array>
+{hours}  </array>
+  <key>StandardOutPath</key><string>{log}/watch.log</string>
+  <key>StandardErrorPath</key><string>{log}/watch.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+""")
+    subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+    r = subprocess.run(["launchctl", "load", str(plist)], capture_output=True, text=True)
+    if r.returncode: die(f"launchctl: {r.stderr.strip()}")
+    ok(f"расписание поставлено: {plist}")
+    ok("каждый час с 9:05 до 19:05 по будням")
+    ok(f"журнал: {log}/watch.log")
+    ok("снять: taiga watch --uninstall")
+
+def cmd_watch(args):
+    import datetime
+    if args.install or args.uninstall: return watch_install(args)
+    auth()
+    reg = reg_load()
+    if not reg: die("реестр пуст — выполните `taiga registry --scan`")
+    st = state_load(); made_total = 0; lines = []; pending = []
+
+    for slug in sorted(reg):
+        folder = reg_path(slug)
+        if not folder:
+            continue                                   # папка исчезла — registry это покажет
+        c, p = api("GET", f"/projects/by_slug?slug={slug}")
+        if c != 200: lines.append(f"{slug}: проект недоступен ({c})"); continue
+        pid = p["id"]
+        last = st.get(slug, {}).get("last")
+        since = (datetime.datetime.fromisoformat(last) if last
+                 else datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=int(args.days)))
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        tri = folder / ".claude" / "триаж"
+        existing = {f.name.split("-")[0] for f in tri.glob("*.md")} if tri.is_dir() else set()
+
+        c, tks = api("GET", f"/tasks?project={pid}", nopage=True)
+        kids = {}
+        for k in (tks or []):
+            if k.get("user_story"): kids.setdefault(k["user_story"], []).append(k)
+
+        made = []
+        for kind, ep in (("us","userstory-statuses"),("task","task-statuses"),("issue","issue-statuses")):
+            c, stt = api("GET", f"/{ep}?project={pid}")
+            closed_ids = {s["id"] for s in (stt or []) if s.get("is_closed")}
+            c, items = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
+            for o in (items or []):
+                cd = o.get("created_date")
+                if not cd: continue
+                if datetime.datetime.fromisoformat(cd.replace("Z","+00:00")) < since: continue
+                if str(o["ref"]) in existing: continue      # заготовка уже есть — не трогаем
+                if o["status"] in closed_ids: continue      # закрытое разбирать незачем
+                c, full = api("GET", f"/{KINDS[kind][0]}/{o['id']}")
+                kd = any(len(((api("GET", f"/tasks/{k['id']}")[1] or {}).get("description") or "").strip()) >= 80
+                         for k in kids.get(o["id"], [])) if kind == "us" else False
+                flags = triage_item(o, full, kd, closed_ids)
+                fn = tri / f"{o['ref']}-{_slugify(o['subject'])}.md"
+                made.append((o["ref"], o["subject"], fn, stub_text(slug, p["name"], kind, o, full, flags, base())))
+
+        if made:
+            made_total += len(made)
+            pending.append((slug, p["name"], tri, made, now))
+            lines.append(f"{p['name']}: новых {len(made)} → {tri}")
+            for ref, subj, _, _ in sorted(made, key=lambda x: x[0]):
+                lines.append(f"    #{ref} {subj[:56]}")
+        elif not args.dry:
+            st[slug] = {"last": now.isoformat(), "folder": str(folder)}
+
+    if made_total > int(args.max) and not args.dry:
+        die(f"к созданию {made_total} заготовок — больше порога {args.max}.\n"
+            f"       Так бывает при первом запуске или после массового импорта.\n"
+            f"       Посмотрите `taiga watch --dry`, затем либо сузьте окно (--days),\n"
+            f"       либо поднимите порог (--max). Отметка времени не сдвинута.")
+    if not args.dry:                                   # запись только после предохранителя
+        for slug, pname, tri, made, now in pending:
+            tri.mkdir(parents=True, exist_ok=True)
+            for ref, subj, fn, body in made: fn.write_text(body)
+            st[slug] = {"last": now.isoformat(), "folder": str(tri.parent.parent)}
+        state_save(st)
+    if made_total:
+        ok("\n".join(lines))
+        if not args.dry:
+            notify("Taiga: новые задачи", f"Заготовок триажа: {made_total}. Спросите в проекте: что по триажу")
+    else:
+        ok("нового нет")
+    if args.dry: ok("\n(сухой прогон — файлы не записаны, отметка времени не сдвинута)")
+
 def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-p","--project", help="слаг проекта (иначе из .claude/tracker.local.md)")
@@ -865,6 +1055,12 @@ def main():
     np.add_argument("--role", help="роль добавляемых участников")
     np.set_defaults(fn=cmd_new_project)
     P("users").set_defaults(fn=cmd_users)
+    w = P("watch"); w.add_argument("--days", default="1", help="за сколько суток при первом запуске")
+    w.add_argument("--dry", action="store_true", help="показать, ничего не записывая")
+    w.add_argument("--max", default="20", help="предохранитель: больше заготовок за раз не создавать")
+    w.add_argument("--install", action="store_true", help="поставить расписание: 9–19 по будням")
+    w.add_argument("--uninstall", action="store_true", help="снять расписание")
+    w.set_defaults(fn=cmd_watch)
     rg = P("registry"); rg.add_argument("--forget", metavar="СЛАГ", help="убрать проект из реестра")
     rg.add_argument("--scan", nargs="?", const="", metavar="ПУТЬ",
                     help="найти уже подключённые проекты и внести в реестр")
