@@ -228,6 +228,8 @@ taiga sync [--dry] [--ref N]   подтянуть статус истории п
 taiga triage [--days N] [--all] [--comment]
                           проверить оформление нового: что нельзя взять в работу
 
+taiga report [--day ГГГГ-ММ-ДД] [--install|--uninstall]
+                          отчёт за предыдущий рабочий день + триаж
 taiga watch [--dry] [--days N] [--install|--uninstall]
                           дозорный: заготовки триажа в папках проектов
 taiga registry [--scan] [--forget <слаг>]

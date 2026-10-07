@@ -974,6 +974,176 @@ def watch_install(args):
     ok(f"журнал: {log}/watch.log")
     ok("снять: taiga watch --uninstall")
 
+
+# ── ежедневный отчёт по активности ──────────────────────────────────────────
+REPORTS = HOME / ".taiga-kit" / "отчёты"
+REPORT_LABEL = "kz.taiga-kit.report"
+
+def report_window(now_local):
+    """[предыдущий рабочий день 00:00, сегодня 00:00) местного времени.
+    Во вторник–пятницу это вчера; в понедельник — пятница, суббота, воскресенье."""
+    import datetime
+    today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    prev = today - datetime.timedelta(days=1)
+    while prev.weekday() >= 5: prev -= datetime.timedelta(days=1)
+    return prev, today
+
+def report_install(args):
+    exe = str(pathlib.Path(sys.argv[0]).resolve())
+    if sys.platform == "win32":
+        name = "TaigaKitReport"
+        if args.uninstall:
+            r = subprocess.run(["schtasks","/Delete","/TN",name,"/F"], capture_output=True, text=True)
+            ok("расписание снято" if not r.returncode else f"schtasks: {r.stdout}{r.stderr}"); return
+        r = subprocess.run(["schtasks","/Create","/TN",name,"/TR",f'"{sys.executable}" "{exe}" report',
+                            "/SC","WEEKLY","/D","MON,TUE,WED,THU,FRI","/ST","09:00","/F"],
+                           capture_output=True, text=True)
+        if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
+        ok(f"расписание поставлено: задание «{name}», будни 09:00"); return
+    if sys.platform != "darwin":
+        ok(f"для cron:  0 9 * * 1-5  {exe} report >> ~/.taiga-kit/report.log 2>&1"); return
+    plist = HOME / "Library" / "LaunchAgents" / f"{REPORT_LABEL}.plist"
+    if args.uninstall:
+        subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+        if plist.exists(): plist.unlink()
+        ok(f"расписание снято: {plist}"); return
+    log = HOME / ".taiga-kit"; log.mkdir(parents=True, exist_ok=True)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    days = "".join(f"    <dict><key>Weekday</key><integer>{d}</integer>"
+                   f"<key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>\n"
+                   for d in range(1, 6))
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{REPORT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{exe}</string><string>report</string></array>
+  <key>StartCalendarInterval</key>
+  <array>
+{days}  </array>
+  <key>StandardOutPath</key><string>{log}/report.log</string>
+  <key>StandardErrorPath</key><string>{log}/report.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+""")
+    subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+    r = subprocess.run(["launchctl","load",str(plist)], capture_output=True, text=True)
+    if r.returncode: die(f"launchctl: {r.stderr.strip()}")
+    ok(f"расписание поставлено: {plist}")
+    ok("будни в 09:00 · отчёт за предыдущий рабочий день")
+    ok(f"папка: {REPORTS}")
+    ok("снять: taiga report --uninstall")
+
+def cmd_report(args):
+    import datetime
+    if args.install or args.uninstall: return report_install(args)
+    auth()
+    TZ = datetime.datetime.now().astimezone().tzinfo       # часовой пояс машины, не прибитый
+    start_l, end_l = report_window(datetime.datetime.now(TZ))
+    if args.day:
+        d = datetime.date.fromisoformat(args.day)
+        start_l = datetime.datetime(d.year, d.month, d.day, tzinfo=TZ)
+        end_l = start_l + datetime.timedelta(days=1)
+    start, end = start_l.astimezone(datetime.timezone.utc), end_l.astimezone(datetime.timezone.utc)
+    _d = lambda s: datetime.datetime.fromisoformat(s.replace("Z","+00:00")) if s else None
+    loc = lambda s: _d(s).astimezone(TZ)
+
+    c, users_raw = api("GET", "/users")
+    users = {u["id"]: (u.get("full_name_display") or u.get("username")) for u in (users_raw or [])}
+    c, projects = api("GET", "/projects")
+    if projects == []: die("список проектов пуст при подтверждённой личности — подозрительно")
+
+    scan = start - datetime.timedelta(days=2)
+    events, created = [], []
+    for p in (projects or []):
+        pid, pname = p["id"], p["name"]
+        cat = {}
+        for kind, ep, api_name in (("us","userstory-statuses","userstory"),
+                                   ("task","task-statuses","task"),
+                                   ("issue","issue-statuses","issue")):
+            c, objs = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
+            touched = [o for o in (objs or []) if _d(o.get("modified_date")) and _d(o["modified_date"]) >= scan]
+            if touched and kind not in cat:
+                c, st = api("GET", f"/{ep}?project={pid}")
+                for s in (st or []): cat[(kind, s["name"])] = s.get("is_closed", False)
+            for o in touched:
+                cd = _d(o.get("created_date"))
+                if cd and start <= cd < end:
+                    created.append({"project": pname, "kind": kind, "ref": o["ref"],
+                                    "subject": o["subject"], "at": o["created_date"],
+                                    "who": users.get(o["owner"], f"id {o['owner']}")})
+                c, h = api("GET", f"/history/{api_name}/{o['id']}")
+                for e in (h or []):
+                    vd = e.get("values_diff") or {}
+                    if "status" not in vd: continue
+                    tm = _d(e["created_at"])
+                    if not (start <= tm < end): continue
+                    events.append({"project": pname, "kind": kind, "ref": o["ref"],
+                                   "subject": o["subject"], "at": e["created_at"],
+                                   "who": (e.get("user") or {}).get("name") or "?",
+                                   "from": vd["status"][0], "to": vd["status"][1],
+                                   "to_closed": cat.get((kind, vd["status"][1]), False),
+                                   "from_closed": cat.get((kind, vd["status"][0]), False)})
+
+    keys = sorted({(e["who"], e["project"]) for e in events} | {(x["who"], x["project"]) for x in created})
+    title = (f"{start_l:%d.%m.%Y}" if (end_l - start_l).days == 1
+             else f"{start_l:%d.%m} – {end_l - datetime.timedelta(days=1):%d.%m.%Y}")
+    L = [f"# Отчёт по Taiga за {title}", "",
+         f"Сформировано {datetime.datetime.now(TZ):%Y-%m-%d %H:%M} · местное время · "
+         f"окно {start_l:%d.%m} 00:00 – {end_l:%d.%m} 00:00", "",
+         "«Взял» и «закрыл» — кто именно переставил карточку (журнал переходов). "
+         "«Создал» — автор объекта.", "", "## Общая таблица", "",
+         "| Человек | Проект | Создал | Взял в работу | Закрыл | Переходов |",
+         "|---|---|---:|---:|---:|---:|"]
+    tot = [0,0,0,0]; rows = []
+    for who, prj in keys:
+        ev = [x for x in events if x["who"] == who and x["project"] == prj]
+        cr = len([x for x in created if x["who"] == who and x["project"] == prj])
+        tk = len([x for x in ev if "progress" in x["to"].lower() and "progress" not in x["from"].lower()])
+        cl = len([x for x in ev if x["to_closed"] and not x["from_closed"]])
+        rows.append((who, prj, cr, tk, cl, len(ev)))
+        for i, v in enumerate((cr, tk, cl, len(ev))): tot[i] += v
+    for r in sorted(rows, key=lambda r: (-r[4], -r[3], -r[2], r[0])):
+        L.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |")
+    if rows:
+        L.append(f"| **Итого** | **{len({r[1] for r in rows})} проектов** | "
+                 f"**{tot[0]}** | **{tot[1]}** | **{tot[2]}** | **{tot[3]}** |")
+    else:
+        L.append("| _активности не было_ | | | | | |")
+    L += ["", "## События статуса", "",
+          "| Время | Человек | Проект | Род | # | Название | Из | В |", "|---|---|---|---|---:|---|---|---|"]
+    for x in sorted(events, key=lambda z: z["at"]):
+        L.append(f"| {loc(x['at']):%d.%m %H:%M} | {x['who']} | {x['project']} | {KINDS[x['kind']][3]} "
+                 f"| {x['ref']} | {x['subject'][:44]} | {x['from']} | {x['to']} |")
+    L += ["", "## Создано", "", "| Время | Человек | Проект | Род | # | Название |", "|---|---|---|---|---:|---|"]
+    for x in sorted(created, key=lambda z: z["at"]):
+        L.append(f"| {loc(x['at']):%d.%m %H:%M} | {x['who']} | {x['project']} | {KINDS[x['kind']][3]} "
+                 f"| {x['ref']} | {x['subject'][:48]} |")
+
+    REPORTS.mkdir(parents=True, exist_ok=True)
+    out = REPORTS / f"Отчёт_Taiga_{start_l:%Y-%m-%d}.md"
+    out.write_text("\n".join(L) + "\n")
+    if not args.no_triage:
+        import io, contextlib
+        buf = io.StringIO()
+        ns = argparse.Namespace(all=True, days="1", comment=False, project=None,
+                                yes=True, kind=None, dry=False)
+        with contextlib.redirect_stdout(buf):
+            try: cmd_triage(ns)
+            except SystemExit: pass
+        with out.open("a") as fh:
+            fh.write("\n## Триаж: что из нового непригодно для работы\n\n"
+                     "Проверка оформления созданного за сутки. Комментарии в трекер не ставятся.\n\n"
+                     "```\n" + buf.getvalue().replace("(отчёт; комментарии в трекер не ставились "
+                     "— для этого ключ --comment)\n", "") + "```\n")
+    ok(f"{out}")
+    ok(f"создано {tot[0]}, взято {tot[1]}, закрыто {tot[2]}, переходов {tot[3]}")
+    if sys.platform == "darwin" and not args.quiet:
+        notify("Taiga: отчёт готов", f"За {title}: создано {tot[0]}, закрыто {tot[2]}")
+    return out
+
 def cmd_watch(args):
     import datetime
     if args.install or args.uninstall: return watch_install(args)
@@ -1073,6 +1243,11 @@ def main():
     np.add_argument("--role", help="роль добавляемых участников")
     np.set_defaults(fn=cmd_new_project)
     P("users").set_defaults(fn=cmd_users)
+    rp = P("report"); rp.add_argument("--day", help="конкретная дата ГГГГ-ММ-ДД")
+    rp.add_argument("--install", action="store_true", help="расписание: будни 09:00")
+    rp.add_argument("--uninstall", action="store_true"); rp.add_argument("--quiet", action="store_true")
+    rp.add_argument("--no-triage", action="store_true", help="без раздела триажа")
+    rp.set_defaults(fn=cmd_report)
     w = P("watch"); w.add_argument("--days", default="1", help="за сколько суток при первом запуске")
     w.add_argument("--dry", action="store_true", help="показать, ничего не записывая")
     w.add_argument("--max", default="20", help="предохранитель: больше заготовок за раз не создавать")
