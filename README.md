@@ -228,7 +228,7 @@ taiga sync [--dry] [--ref N]   подтянуть статус истории п
 taiga triage [--days N] [--all] [--comment]
                           проверить оформление нового: что нельзя взять в работу
 
-taiga report [--day ГГГГ-ММ-ДД] [--install|--uninstall]
+taiga report [--day ГГГГ-ММ-ДД] [--install [--at ЧЧ:ММ] [--all-days] |--uninstall]
                           отчёт за предыдущий рабочий день + триаж
 taiga watch [--dry] [--days N] [--install|--uninstall]
        [--every Ч] [--start Ч] [--end Ч] [--all-days]   период опроса
