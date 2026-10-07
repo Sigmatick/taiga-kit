@@ -41,6 +41,22 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { Fail 'нет Clau
 Write-Host "  claude:  $((claude --version) -split "`n" | Select-Object -First 1)"
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Warn '  git не найден — связь задач с коммитами работать не будет' }
 
+# ── роль ──
+Bold 'Кто вы?'
+Write-Host @'
+  1) Менеджер — вести задачи: смотреть, создавать, двигать по доске,
+     раскладывать техническое задание в эпики и истории.
+
+  2) Разработчик — то же плюс дозорный: раз в час проверяет трекер,
+     кладёт заготовки разбора в папки проектов и уведомляет.
+'@
+$role = ''
+while (-not $role) {
+    $a = Read-Host '  1 или 2'
+    if ($a -eq '1') { $role = 'pm' } elseif ($a -eq '2') { $role = 'dev' } else { Warn '  введите 1 или 2' }
+}
+Write-Host "  выбрано: $(if ($role -eq 'dev') {'разработчик'} else {'менеджер'})"
+
 # ── 2. плагин ───────────────────────────────────────────────────────────────
 Bold 'Шаг 2 из 5. Плагин Claude Code'
 if ((claude plugin list 2>$null) -match 'taiga-kit') {
@@ -119,6 +135,27 @@ if ($slug) {
 } else {
     Bold 'Готово'
     Write-Host '  Проект подключите позже: перейти в его папку и  taiga init <слаг>'
+}
+
+# ── для разработчика: реестр и дозорный ──
+if ($role -eq 'dev') {
+    Bold 'Дополнительно для разработчика'
+    Write-Host '  наполняю реестр проектов…'
+    & "$bin\taiga.cmd" registry --scan
+    Write-Host ''
+    Write-Host @'
+  Дозорный раз в час (9–19 по будням) проверяет трекер и кладёт
+  заготовки разбора в <проект>\.claude\триаж\. Код не меняет,
+  в трекер не пишет.
+'@
+    if (Ask '  поставить дозорного на расписание?') {
+        & "$bin\taiga.cmd" watch --install
+        Write-Host ''
+        Write-Host '  первая проверка за сутки:'
+        & "$bin\taiga.cmd" watch --days 1
+    } else {
+        Write-Host '  пропущено. Поставить позже:  taiga watch --install'
+    }
 }
 
 Read-Host "`nEnter — закрыть"

@@ -916,9 +916,27 @@ LAUNCH_LABEL = "kz.taiga-kit.watch"
 def watch_install(args):
     """Расписание дозорного. macOS — launchd; на другом — подсказка для cron."""
     exe = str((pathlib.Path(sys.argv[0]).resolve()))
+    if sys.platform == "win32":
+        # Планировщик заданий: еженедельно по будням, старт 9:05, повтор каждый час 10 часов.
+        # На живой Windows не проверялось.
+        name = "TaigaKitWatch"
+        if args.uninstall:
+            r = subprocess.run(["schtasks", "/Delete", "/TN", name, "/F"], capture_output=True, text=True)
+            ok("расписание снято" if not r.returncode else f"schtasks: {r.stdout}{r.stderr}")
+            return
+        cmd = f'"{sys.executable}" "{exe}" watch'
+        r = subprocess.run(["schtasks", "/Create", "/TN", name, "/TR", cmd,
+                            "/SC", "WEEKLY", "/D", "MON,TUE,WED,THU,FRI",
+                            "/ST", "09:05", "/RI", "60", "/DU", "0010:00", "/F"],
+                           capture_output=True, text=True)
+        if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
+        ok(f"расписание поставлено: задание «{name}»")
+        ok("каждый час с 9:05 до 19:05 по будням")
+        ok("снять: taiga watch --uninstall")
+        return
     if sys.platform != "darwin":
-        ok("автоустановка расписания есть только для macOS. Для cron добавьте строку:")
-        ok(f"  0 9-19 * * 1-5  {exe} watch >> ~/.taiga-kit/watch.log 2>&1")
+        ok("автоустановка расписания есть для macOS и Windows. Для cron добавьте строку:")
+        ok(f"  5 9-19 * * 1-5  {exe} watch >> ~/.taiga-kit/watch.log 2>&1")
         return
     plist = HOME / "Library" / "LaunchAgents" / f"{LAUNCH_LABEL}.plist"
     if args.uninstall:
