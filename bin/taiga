@@ -925,13 +925,16 @@ def watch_install(args):
             ok("расписание снято" if not r.returncode else f"schtasks: {r.stdout}{r.stderr}")
             return
         cmd = f'"{sys.executable}" "{exe}" watch'
+        h_from, h_to, every = int(args.start), int(args.end), max(1, int(args.every))
+        dw = "MON,TUE,WED,THU,FRI,SAT,SUN" if args.all_days else "MON,TUE,WED,THU,FRI"
         r = subprocess.run(["schtasks", "/Create", "/TN", name, "/TR", cmd,
-                            "/SC", "WEEKLY", "/D", "MON,TUE,WED,THU,FRI",
-                            "/ST", "09:05", "/RI", "60", "/DU", "0010:00", "/F"],
+                            "/SC", "WEEKLY", "/D", dw,
+                            "/ST", f"{h_from:02d}:05", "/RI", str(every * 60),
+                            "/DU", f"{max(1, h_to - h_from):04d}:00", "/F"],
                            capture_output=True, text=True)
         if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
         ok(f"расписание поставлено: задание «{name}»")
-        ok("каждый час с 9:05 до 19:05 по будням")
+        ok(f"{'каждый час' if every == 1 else f'каждые {every} ч'} с {h_from}:05 до {h_to}:05")
         ok("снять: taiga watch --uninstall")
         return
     if sys.platform != "darwin":
@@ -943,10 +946,15 @@ def watch_install(args):
         subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
         if plist.exists(): plist.unlink()
         ok(f"расписание снято: {plist}"); return
+    h_from, h_to, every = int(args.start), int(args.end), max(1, int(args.every))
+    if not (0 <= h_from <= 23 and 0 <= h_to <= 23 and h_from <= h_to):
+        die("часы должны быть 0–23 и --start не позже --end")
+    days = range(1, 6) if not args.all_days else range(0, 7)
+    hour_list = list(range(h_from, h_to + 1, every))
     hours = "".join(
         f"    <dict><key>Weekday</key><integer>{d}</integer>"
         f"<key>Hour</key><integer>{h}</integer><key>Minute</key><integer>5</integer></dict>\n"
-        for d in range(1, 6) for h in range(9, 20))
+        for d in days for h in hour_list)
     log = HOME / ".taiga-kit"
     log.mkdir(parents=True, exist_ok=True)
     plist.parent.mkdir(parents=True, exist_ok=True)
@@ -970,7 +978,9 @@ def watch_install(args):
     r = subprocess.run(["launchctl", "load", str(plist)], capture_output=True, text=True)
     if r.returncode: die(f"launchctl: {r.stderr.strip()}")
     ok(f"расписание поставлено: {plist}")
-    ok("каждый час с 9:05 до 19:05 по будням")
+    sched = ("каждый час" if every == 1 else f"каждые {every} ч")
+    ok(f"{sched} с {h_from}:05 до {h_to}:05, "
+       f"{'все дни' if args.all_days else 'по будням'} ({len(hour_list) * len(list(days))} проверок в неделю)")
     ok(f"журнал: {log}/watch.log")
     ok("снять: taiga watch --uninstall")
 
@@ -1253,6 +1263,10 @@ def main():
     w.add_argument("--max", default="20", help="предохранитель: больше заготовок за раз не создавать")
     w.add_argument("--install", action="store_true", help="поставить расписание: 9–19 по будням")
     w.add_argument("--uninstall", action="store_true", help="снять расписание")
+    w.add_argument("--every", default="1", metavar="Ч", help="период опроса в часах, по умолчанию 1")
+    w.add_argument("--start", default="9", metavar="Ч", help="с какого часа, по умолчанию 9")
+    w.add_argument("--end", default="19", metavar="Ч", help="по какой час, по умолчанию 19")
+    w.add_argument("--all-days", action="store_true", help="включая выходные")
     w.set_defaults(fn=cmd_watch)
     rg = P("registry"); rg.add_argument("--forget", metavar="СЛАГ", help="убрать проект из реестра")
     rg.add_argument("--scan", nargs="?", const="", metavar="ПУТЬ",

@@ -231,6 +231,7 @@ taiga triage [--days N] [--all] [--comment]
 taiga report [--day ГГГГ-ММ-ДД] [--install|--uninstall]
                           отчёт за предыдущий рабочий день + триаж
 taiga watch [--dry] [--days N] [--install|--uninstall]
+       [--every Ч] [--start Ч] [--end Ч] [--all-days]   период опроса
                           дозорный: заготовки триажа в папках проектов
 taiga registry [--scan] [--forget <слаг>]
                           реестр «слаг → папка с кодом», ~/.taiga-kit/projects.json

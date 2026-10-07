@@ -201,6 +201,8 @@ taiga watch                  одна проверка (её и зовёт ра�
 taiga watch --dry            показать, ничего не записывая
 taiga watch --days 3         при первом запуске — за сколько суток смотреть назад
 taiga watch --install        расписание: каждый час 9–19 по будням
+taiga watch --install --every 2 --start 8 --end 20 --all-days
+                             период, границы часов, выходные
 taiga watch --uninstall      снять расписание
 ```
 
