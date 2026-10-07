@@ -270,37 +270,13 @@ def cmd_show(args):
     ok(f"  исполнитель: {(f.get('assigned_to_extra_info') or {}).get('full_name_display') or '—'}")
     ok(f"  создана:     {f['created_date'][:10]} · версия {f['version']}")
     if f.get("description"): ok("\n" + f["description"])
-    c, att = api("GET", f"/{KINDS[kind][0]}/attachments?object_id={it['id']}&project={p['id']}")
-    live = [a for a in (att or []) if not a.get("is_deprecated")]
-    if live:
-        ok("\n  вложения:")
-        for a in live:
-            ok(f"    {a.get('created_date','')[:16]}  {a.get('name')}  {a.get('url') or ''}")
     c, h = api("GET", f"/history/{KINDS[kind][1]}/{it['id']}")
-    ev = [e for e in (h or []) if e.get("values_diff") or
-          ((e.get("comment") or "").strip() and not e.get("delete_comment_date"))]
+    ev = [e for e in (h or []) if "status" in (e.get("values_diff") or {})]
     if ev:
-        ok("\n  история:")
-        for e in sorted(ev, key=lambda x: x["created_at"]):
-            who = (e.get("user") or {}).get("name", "?")
-            head = f"    {e['created_at'][:16]}  {who:<22}"
-            vd = e.get("values_diff") or {}
-            if "status" in vd:
-                ok(f"{head} статус: {vd['status'][0]} → {vd['status'][1]}")
-            for a in (vd.get("attachments") or {}).get("new", []):
-                ok(f"{head} вложение: {a.get('filename') or a.get('name')}")
-            other = [k for k in vd if k not in ("status", "attachments")]
-            if other:
-                ok(f"{head} изменено: {', '.join(other)}")
-            if "description_diff" in vd and vd.get("description"):
-                old, new = vd["description"]
-                ok(f"      было:  {(old or '').strip()[:400]}")
-                ok(f"      стало: {(new or '').strip()[:400]}")
-            text = (e.get("comment") or "").strip()
-            if text and not e.get("delete_comment_date"):
-                ok(f"{head} комментарий:")
-                for line in text.splitlines():
-                    ok(f"      {line}")
+        ok("\n  переходы:")
+        for e in reversed(ev):
+            v = e["values_diff"]["status"]
+            ok(f"    {e['created_at'][:16]}  {(e.get('user') or {}).get('name','?'):<22} {v[0]} → {v[1]}")
 
 def cmd_new(args):
     p = project(args); pid = p["id"]; kind = args.kind or "us"
@@ -687,6 +663,100 @@ def cmd_sync(args):
             ok(f"  ! #{x['us']['ref']} → {c} {r}"); fail += 1; break
     ok(f"\nпереведено {done}, отказов {fail}")
 
+
+# ── триаж: что из нового непригодно для работы ───────────────────────────────
+# Признак «нет описания» сам по себе не годится: в части проектов заголовок
+# самодостаточен, а у историй описание бывает в дочерних задачах. Поэтому
+# флаги ставятся по совокупности, и молчание — поведение по умолчанию.
+STUB_TITLES = {"другие задачи", "прочее", "разное", "задачи", "тест", "test",
+               "экспорт", "импорт", "доработки", "правки", "баги", "fix", "todo"}
+
+def triage_item(o, full, kids_desc, closed_ids):
+    """Список замечаний к единице работы. Пусто — вопросов нет."""
+    flags = []
+    subj = (o.get("subject") or "").strip()
+    desc = (full.get("description") or "").strip()
+    has_text = len(desc) >= 80 or kids_desc
+    if subj.lower() in STUB_TITLES:
+        flags.append("заголовок-заглушка: по нему нельзя понять задачу")
+    elif not has_text and len(subj) < 40:
+        flags.append(f"нет описания, заголовок короткий ({len(subj)} симв.)")
+    if not o.get("assigned_to") and o["status"] not in closed_ids:
+        flags.append("не назначена ни на кого")
+    st = (o.get("status_extra_info") or {}).get("name", "").lower()
+    if "bug" in st and has_text:
+        low = (desc + " " + subj).lower()
+        if not any(w in low for w in ("ожида", "должн", "expected", "воспроизв", "шаг")):
+            flags.append("баг без ожидаемого поведения и шагов воспроизведения")
+    return flags
+
+def cmd_triage(args):
+    if args.all:
+        c, ps = api("GET", "/projects")
+        first = True
+        for pr in sorted(ps or [], key=lambda x: x["name"].lower()):
+            if not first: ok("")
+            first = False
+            ns = argparse.Namespace(**{**vars(args), "all": False, "project": pr["slug"]})
+            try: _triage_one(ns)
+            except SystemExit as e: ok(f"{pr['name']}: {e}")
+        return
+    _triage_one(args)
+
+def _triage_one(args):
+    from datetime import datetime, timezone, timedelta
+    p = project(args); pid = p["id"]
+    since = datetime.now(timezone.utc) - timedelta(days=int(args.days))
+    def _dt(s): return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
+
+    c, tks = api("GET", f"/tasks?project={pid}", nopage=True)
+    kids = {}
+    for k in (tks or []):
+        if k.get("user_story"): kids.setdefault(k["user_story"], []).append(k)
+
+    total = 0; rows = []
+    for kind, ep in (("us","userstory-statuses"),
+                     ("task","task-statuses"),
+                     ("issue","issue-statuses")):
+        c, st = api("GET", f"/{ep}?project={pid}")
+        closed_ids = {s["id"] for s in (st or []) if s.get("is_closed")}
+        c, items = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
+        for o in (items or []):
+            if not (_dt(o.get("created_date")) and _dt(o["created_date"]) >= since): continue
+            total += 1
+            c, full = api("GET", f"/{KINDS[kind][0]}/{o['id']}")
+            kd = False
+            if kind == "us":
+                for k in kids.get(o["id"], []):
+                    c, kf = api("GET", f"/tasks/{k['id']}")
+                    if len((kf.get("description") or "").strip()) >= 80: kd = True; break
+            fl = triage_item(o, full, kd, closed_ids)
+            if fl: rows.append((kind, o, fl))
+
+    ok(f"{p['name']}: новых за {args.days} дн — {total}, с замечаниями — {len(rows)}")
+    if not rows:
+        ok("всё оформлено достаточно для работы"); return
+    for kind, o, fl in sorted(rows, key=lambda x: -x[1]["ref"]):
+        ok(f"\n  #{o['ref']} · {KINDS[kind][3]} · {o['subject'][:56]}")
+        for x in fl: ok(f"      — {x}")
+    if not args.comment:
+        ok(f"\n(отчёт; комментарии в трекер не ставились — для этого ключ --comment)")
+        return
+    ok("")
+    if not confirm(args, f"оставить комментарий в {len(rows)} тикетах"): return
+    n = 0
+    for kind, o, fl in rows:
+        text = ("Автопроверка оформления. Чтобы задачу можно было взять в работу, не хватает:\n"
+                + "\n".join(f"- {x}" for x in fl))
+        c, h = api("GET", f"/history/{KINDS[kind][1]}/{o['id']}")
+        if any("Автопроверка оформления" in (e.get("comment") or "") for e in (h or [])):
+            ok(f"  #{o['ref']} уже прокомментирован"); continue
+        c, cur = api("GET", f"/{KINDS[kind][0]}/{o['id']}")
+        c, r = api("PATCH", f"/{KINDS[kind][0]}/{o['id']}", {"version": cur["version"], "comment": text})
+        if c == 200: n += 1; ok(f"  #{o['ref']} прокомментирован")
+        else: ok(f"  ! #{o['ref']} → {c}")
+    ok(f"\nпрокомментировано {n}")
+
 def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-p","--project", help="слаг проекта (иначе из .claude/tracker.local.md)")
@@ -712,6 +782,10 @@ def main():
     np.add_argument("--role", help="роль добавляемых участников")
     np.set_defaults(fn=cmd_new_project)
     P("users").set_defaults(fn=cmd_users)
+    tr = P("triage"); tr.add_argument("--days", default="1", help="за сколько суток, по умолчанию 1")
+    tr.add_argument("--comment", action="store_true", help="оставить замечания комментарием в трекере")
+    tr.add_argument("--all", action="store_true", help="по всем доступным проектам")
+    tr.set_defaults(fn=cmd_triage)
     sy = P("sync"); sy.add_argument("--ref", help="только одна история")
     sy.add_argument("--dry", action="store_true", help="только показать расхождения")
     sy.set_defaults(fn=cmd_sync)
