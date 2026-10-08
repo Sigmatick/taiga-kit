@@ -1201,7 +1201,33 @@ def cmd_watch(args):
     auth()
     reg = reg_load()
     if not reg: die("реестр пуст — выполните `taiga registry --scan`")
+    if args.filter:
+        if args.filter not in ("mine", "mine+free", "all"):
+            die("отбор: mine, mine+free или all")
+        cfg_set("watch_filter", args.filter)
+        ok(f"отбор запомнен: {args.filter}")
+    flt = cfg_load().get("watch_filter", "mine+free")
     st = state_load(); made_total = 0; lines = []; pending = []
+    if args.prune:
+        n = 0
+        for slug in sorted(reg_load()):
+            folder = reg_path(slug)
+            tri = (folder / ".claude" / "триаж") if folder else None
+            if not (tri and tri.is_dir()): continue
+            c, p = api("GET", f"/projects/by_slug?slug={slug}")
+            if c != 200: continue
+            for fn in sorted(tri.glob("*.md")):
+                txt = fn.read_text(errors="ignore")
+                if "статус: ждёт разведки" not in txt: continue   # правленое не трогаем
+                m = re.search(r"исполнитель: (.+)$", txt, re.M)
+                who = (m.group(1).strip() if m else "")
+                me = (IDENTITY.get("full_name_display") or IDENTITY.get("username") or "")
+                keep = (who == me) or (flt == "mine+free" and who == "не назначена") or flt == "all"
+                if not keep:
+                    fn.unlink(); n += 1
+                    ok(f"  убрано: {slug}/{fn.name[:46]}  ({who})")
+        ok(f"\nубрано заготовок: {n} (отбор {flt}; правленые вручную не трогались)")
+        return
 
     for slug in sorted(reg):
         folder = reg_path(slug)
@@ -1234,6 +1260,9 @@ def cmd_watch(args):
                 if datetime.datetime.fromisoformat(cd.replace("Z","+00:00")) < since: continue
                 if str(o["ref"]) in existing: continue      # заготовка уже есть — не трогаем
                 if o["status"] in closed_ids: continue      # закрытое разбирать незачем
+                a = o.get("assigned_to")
+                if flt == "mine" and a != IDENTITY["id"]: continue
+                if flt == "mine+free" and a not in (IDENTITY["id"], None): continue
                 c, full = api("GET", f"/{KINDS[kind][0]}/{o['id']}")
                 kd = any(len(((api("GET", f"/tasks/{k['id']}")[1] or {}).get("description") or "").strip()) >= 80
                          for k in kids.get(o["id"], [])) if kind == "us" else False
@@ -1311,6 +1340,8 @@ def main():
     w.add_argument("--start", default="9", metavar="Ч", help="с какого часа, по умолчанию 9")
     w.add_argument("--end", default="19", metavar="Ч", help="по какой час, по умолчанию 19")
     w.add_argument("--all-days", action="store_true", help="включая выходные")
+    w.add_argument("--filter", metavar="КТО", help="чьи тикеты брать: mine, mine+free, all (запоминается)")
+    w.add_argument("--prune", action="store_true", help="убрать заготовки, не подходящие под отбор")
     w.set_defaults(fn=cmd_watch)
     rg = P("registry"); rg.add_argument("--forget", metavar="СЛАГ", help="убрать проект из реестра")
     rg.add_argument("--scan", nargs="?", const="", metavar="ПУТЬ",
