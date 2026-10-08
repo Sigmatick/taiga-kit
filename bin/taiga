@@ -986,7 +986,24 @@ def watch_install(args):
 
 
 # ── ежедневный отчёт по активности ──────────────────────────────────────────
-REPORTS = HOME / ".taiga-kit" / "отчёты"
+CONFIG = HOME / ".taiga-kit" / "config.json"
+
+def cfg_load():
+    if not CONFIG.is_file(): return {}
+    try: d = json.loads(CONFIG.read_text())
+    except json.JSONDecodeError: return {}
+    return d if isinstance(d, dict) else {}
+
+def cfg_set(key, value):
+    d = cfg_load(); d[key] = value
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n"); tmp.replace(CONFIG)
+
+def reports_dir():
+    """Куда складывать отчёты. Запомненный путь главнее умолчания."""
+    v = cfg_load().get("reports_dir")
+    return pathlib.Path(os.path.expanduser(v)) if v else HOME / ".taiga-kit" / "отчёты"
 REPORT_LABEL = "kz.taiga-kit.report"
 
 def report_window(now_local):
@@ -1051,11 +1068,26 @@ def report_install(args):
     ok(f"расписание поставлено: {plist}")
     ok(f"{'каждый день' if args.all_days else 'будни'} в {hh:02d}:{mm:02d} · "
        f"отчёт за предыдущий рабочий день")
-    ok(f"папка: {REPORTS}")
+    ok(f"папка: {reports_dir()}")
     ok("снять: taiga report --uninstall")
 
 def cmd_report(args):
     import datetime
+    if args.set_dir:
+        p = pathlib.Path(os.path.expanduser(args.set_dir))
+        p.mkdir(parents=True, exist_ok=True)
+        old = reports_dir()
+        moved = 0
+        if old.is_dir() and old.resolve() != p.resolve():
+            for src in sorted(old.glob("Отчёт_Taiga_*.md")):
+                dst = p / src.name
+                if dst.exists(): ok(f"  уже есть: {src.name}"); continue
+                src.replace(dst); moved += 1
+        cfg_set("reports_dir", str(p))
+        ok(f"отчёты теперь в: {p}")
+        if moved: ok(f"перенесено файлов: {moved} (из {old})")
+        ok(f"путь запомнен в {CONFIG}")
+        return
     if args.install or args.uninstall: return report_install(args)
     auth()
     TZ = datetime.datetime.now().astimezone().tzinfo       # часовой пояс машины, не прибитый
@@ -1140,8 +1172,9 @@ def cmd_report(args):
         L.append(f"| {loc(x['at']):%d.%m %H:%M} | {x['who']} | {x['project']} | {KINDS[x['kind']][3]} "
                  f"| {x['ref']} | {x['subject'][:48]} |")
 
-    REPORTS.mkdir(parents=True, exist_ok=True)
-    out = REPORTS / f"Отчёт_Taiga_{start_l:%Y-%m-%d}.md"
+    rd = reports_dir()
+    rd.mkdir(parents=True, exist_ok=True)
+    out = rd / f"Отчёт_Taiga_{start_l:%Y-%m-%d}.md"
     out.write_text("\n".join(L) + "\n")
     if not args.no_triage:
         import io, contextlib
@@ -1267,6 +1300,7 @@ def main():
     rp.add_argument("--no-triage", action="store_true", help="без раздела триажа")
     rp.add_argument("--at", default="09:00", metavar="ЧЧ:ММ", help="время запуска, по умолчанию 09:00")
     rp.add_argument("--all-days", action="store_true", help="включая выходные")
+    rp.add_argument("--set-dir", metavar="ПУТЬ", help="запомнить, куда складывать отчёты (и перенести прежние)")
     rp.set_defaults(fn=cmd_report)
     w = P("watch"); w.add_argument("--days", default="1", help="за сколько суток при первом запуске")
     w.add_argument("--dry", action="store_true", help="показать, ничего не записывая")
