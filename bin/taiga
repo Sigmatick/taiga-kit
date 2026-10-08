@@ -1206,7 +1206,12 @@ def cmd_watch(args):
             die("отбор: mine, mine+free или all")
         cfg_set("watch_filter", args.filter)
         ok(f"отбор запомнен: {args.filter}")
+    if args.statuses is not None:
+        v = [s.strip() for s in args.statuses.split(",") if s.strip()]
+        cfg_set("watch_statuses", v)
+        ok(f"отбор по статусу запомнен: {', '.join(v) if v else 'любой'}")
     flt = cfg_load().get("watch_filter", "mine+free")
+    want_st = {s.lower() for s in cfg_load().get("watch_statuses", [])}
     st = state_load(); made_total = 0; lines = []; pending = []
     if args.prune:
         n = 0
@@ -1222,10 +1227,14 @@ def cmd_watch(args):
                 m = re.search(r"исполнитель: (.+)$", txt, re.M)
                 who = (m.group(1).strip() if m else "")
                 me = (IDENTITY.get("full_name_display") or IDENTITY.get("username") or "")
-                keep = (who == me) or (flt == "mine+free" and who == "не назначена") or flt == "all"
+                ms = re.search(r"статус в трекере: (.+?) ·", txt)
+                tracker_st = (ms.group(1).strip().lower() if ms else "")
+                by_who = (who == me) or (flt == "mine+free" and who == "не назначена") or flt == "all"
+                by_st = (not want_st) or (tracker_st in want_st)
+                keep = by_who and by_st
                 if not keep:
                     fn.unlink(); n += 1
-                    ok(f"  убрано: {slug}/{fn.name[:46]}  ({who})")
+                    ok(f"  убрано: {slug}/{fn.name[:42]}  ({who}, {tracker_st or '?'})")
         ok(f"\nубрано заготовок: {n} (отбор {flt}; правленые вручную не трогались)")
         return
 
@@ -1236,14 +1245,27 @@ def cmd_watch(args):
         c, p = api("GET", f"/projects/by_slug?slug={slug}")
         if c != 200: lines.append(f"{slug}: проект недоступен ({c})"); continue
         pid = p["id"]
-        last = st.get(slug, {}).get("last")
+        last = None if args.days else st.get(slug, {}).get("last")
         since = (datetime.datetime.fromisoformat(last) if last
-                 else datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=int(args.days)))
+                 else datetime.datetime.now(datetime.timezone.utc)
+                      - datetime.timedelta(days=int(args.days or 1)))
         now = datetime.datetime.now(datetime.timezone.utc)
 
         tri = folder / ".claude" / "триаж"
         existing = {f.name.split("-")[0] for f in tri.glob("*.md")} if tri.is_dir() else set()
 
+        if want_st:
+            have = set()
+            for ep in ("userstory-statuses", "task-statuses", "issue-statuses"):
+                c, ss = api("GET", f"/{ep}?project={pid}")
+                have |= {s["name"].strip().lower() for s in (ss or [])}
+            missing = sorted(want_st - have)
+            if len(missing) == len(want_st):
+                lines.append(f"{p['name']}: ни одного из заданных статусов нет в каталоге "
+                             f"({', '.join(missing)}) — проект пропущен")
+                continue
+            if missing:
+                lines.append(f"{p['name']}: нет статусов {', '.join(missing)} — учтены остальные")
         c, tks = api("GET", f"/tasks?project={pid}", nopage=True)
         kids = {}
         for k in (tks or []):
@@ -1255,14 +1277,19 @@ def cmd_watch(args):
             closed_ids = {s["id"] for s in (stt or []) if s.get("is_closed")}
             c, items = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
             for o in (items or []):
-                cd = o.get("created_date")
-                if not cd: continue
-                if datetime.datetime.fromisoformat(cd.replace("Z","+00:00")) < since: continue
+                # Когда отбор по статусу задан, важна дата ИЗМЕНЕНИЯ: тикет мог
+                # пролежать месяц и попасть в BUG сегодня. Без отбора — дата создания.
+                stamp = o.get("modified_date") if want_st else o.get("created_date")
+                if not stamp: continue
+                if datetime.datetime.fromisoformat(stamp.replace("Z","+00:00")) < since: continue
                 if str(o["ref"]) in existing: continue      # заготовка уже есть — не трогаем
                 if o["status"] in closed_ids: continue      # закрытое разбирать незачем
                 a = o.get("assigned_to")
                 if flt == "mine" and a != IDENTITY["id"]: continue
                 if flt == "mine+free" and a not in (IDENTITY["id"], None): continue
+                if want_st:
+                    nm = (o.get("status_extra_info") or {}).get("name", "").strip().lower()
+                    if nm not in want_st: continue
                 c, full = api("GET", f"/{KINDS[kind][0]}/{o['id']}")
                 kd = any(len(((api("GET", f"/tasks/{k['id']}")[1] or {}).get("description") or "").strip()) >= 80
                          for k in kids.get(o["id"], [])) if kind == "us" else False
@@ -1290,6 +1317,8 @@ def cmd_watch(args):
             for ref, subj, fn, body in made: fn.write_text(body)
             st[slug] = {"last": now.isoformat(), "folder": str(tri.parent.parent)}
         state_save(st)
+    if lines and not made_total:
+        ok("\n".join(lines))                      # предупреждения не глотаем
     if made_total:
         ok("\n".join(lines))
         if not args.dry:
@@ -1331,7 +1360,7 @@ def main():
     rp.add_argument("--all-days", action="store_true", help="включая выходные")
     rp.add_argument("--set-dir", metavar="ПУТЬ", help="запомнить, куда складывать отчёты (и перенести прежние)")
     rp.set_defaults(fn=cmd_report)
-    w = P("watch"); w.add_argument("--days", default="1", help="за сколько суток при первом запуске")
+    w = P("watch"); w.add_argument("--days", help="смотреть за N суток назад, игнорируя отметку времени")
     w.add_argument("--dry", action="store_true", help="показать, ничего не записывая")
     w.add_argument("--max", default="20", help="предохранитель: больше заготовок за раз не создавать")
     w.add_argument("--install", action="store_true", help="поставить расписание: 9–19 по будням")
@@ -1342,6 +1371,8 @@ def main():
     w.add_argument("--all-days", action="store_true", help="включая выходные")
     w.add_argument("--filter", metavar="КТО", help="чьи тикеты брать: mine, mine+free, all (запоминается)")
     w.add_argument("--prune", action="store_true", help="убрать заготовки, не подходящие под отбор")
+    w.add_argument("--statuses", metavar="СПИСОК",
+                   help="какие статусы брать, через запятую; пусто — любые (запоминается)")
     w.set_defaults(fn=cmd_watch)
     rg = P("registry"); rg.add_argument("--forget", metavar="СЛАГ", help="убрать проект из реестра")
     rg.add_argument("--scan", nargs="?", const="", metavar="ПУТЬ",
