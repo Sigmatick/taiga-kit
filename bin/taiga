@@ -1162,6 +1162,53 @@ def cmd_report(args):
                  f"**{tot[0]}** | **{tot[1]}** | **{tot[2]}** | **{tot[3]}** |")
     else:
         L.append("| _активности не было_ | | | | | |")
+    # ── что бросается в глаза: только арифметика, без оценок людей ──────────
+    reopened = [x for x in events if x["from_closed"] and not x["to_closed"]]
+    took = [x for x in events if "progress" in x["to"].lower() and "progress" not in x["from"].lower()]
+    closed_ev = [x for x in events if x["to_closed"] and not x["from_closed"]]
+    closed_refs = {(x["project"], x["ref"]) for x in closed_ev}
+    took_open = [x for x in took if (x["project"], x["ref"]) not in closed_refs]
+    by_closer = {}
+    for x in closed_ev: by_closer[x["who"]] = by_closer.get(x["who"], 0) + 1
+    silent = sorted({p["name"] for p in (projects or [])} -
+                    {x["project"] for x in events} - {x["project"] for x in created})
+
+    obs = []
+    delta = tot[0] - tot[2]
+    if delta > 0:
+        obs.append(f"**Бэклог вырос на {delta}**: создано {tot[0]}, закрыто {tot[2]}.")
+    elif delta < 0:
+        obs.append(f"**Бэклог сократился на {-delta}**: закрыто {tot[2]}, создано {tot[0]}.")
+    else:
+        obs.append(f"Создано и закрыто поровну — по {tot[0]}.")
+    if by_closer:
+        top = sorted(by_closer.items(), key=lambda kv: -kv[1])
+        who, n = top[0]
+        if len(by_closer) == 1:
+            obs.append(f"Все {n} закрытий — {who}.")
+        elif n >= sum(by_closer.values()) * 0.5:
+            obs.append(f"Больше половины закрытий ({n} из {sum(by_closer.values())}) — {who}.")
+    if took_open:
+        obs.append(f"**Взято в работу и не закрыто: {len(took_open)}** — "
+                   + ", ".join(f"{x['project']} #{x['ref']}" for x in took_open[:6])
+                   + (" и другие" if len(took_open) > 6 else "") + ".")
+    if reopened:
+        obs.append(f"**Переоткрыто: {len(reopened)}** — "
+                   + ", ".join(f"{x['project']} #{x['ref']} ({x['from']} → {x['to']})"
+                               for x in reopened[:4])
+                   + (" и другие" if len(reopened) > 4 else "")
+                   + ". Карточка вернулась из закрывающего статуса в рабочий.")
+    if silent:
+        obs.append(f"Без движения: {', '.join(silent)}.")
+    if not events and not created:
+        obs = ["За эти сутки в трекере не происходило ничего."]
+
+    L += ["", "## Что бросается в глаза", ""]
+    L += [f"- {x}" for x in obs]
+    L += ["", "_Только арифметика по журналу переходов. Перемещение карточки измеряет и работу, "
+          "и дисциплину ведения доски; карточки не нормированы по объёму. Выводы о людях "
+          "по этим числам делать нельзя._"]
+
     L += ["", "## События статуса", "",
           "| Время | Человек | Проект | Род | # | Название | Из | В |", "|---|---|---|---|---:|---|---|---|"]
     for x in sorted(events, key=lambda z: z["at"]):
