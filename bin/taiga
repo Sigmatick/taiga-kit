@@ -7,7 +7,7 @@
 
 Секрет в конфиг не пишется никогда — только путь к нему.
 """
-import argparse, getpass, json, os, re, sys, pathlib, subprocess, urllib.request, urllib.error
+import argparse, getpass, json, os, re, sys, time, pathlib, subprocess, urllib.request, urllib.error
 
 HOME = pathlib.Path.home()
 DEF_URL, DEF_TOK, DEF_REF = HOME/".taiga.url", HOME/".taiga.token", HOME/".taiga.refresh"
@@ -159,20 +159,29 @@ def cmd_registry(args):
         ok(f"\nисчезло папок: {len(gone)}. Убрать: taiga registry --forget <слаг>")
 
 # ── транспорт ────────────────────────────────────────────────────────────────
-def raw(method, path, body=None, token=None, nopage=False):
-    r = urllib.request.Request(base()+"/api/v1"+path, method=method,
-                               data=json.dumps(body).encode() if body is not None else None)
-    r.add_header("Authorization", "Bearer " + (token or tok()))
-    if body is not None: r.add_header("Content-Type", "application/json")
-    if nopage: r.add_header("x-disable-pagination", "True")
-    try:
-        with urllib.request.urlopen(r, timeout=60) as x:
-            t = x.read().decode(); return x.status, (json.loads(t) if t.strip() else None)
-    except urllib.error.HTTPError as e:
-        t = e.read().decode()
-        try: return e.code, json.loads(t)
-        except Exception: return e.code, t[:300]
-    except Exception as e: die(f"сеть: {e}")
+def raw(method, path, body=None, token=None, nopage=False, tries=3):
+    """Сетевой сбой — не повод терять весь прогон: отчёт делает сотни запросов,
+    и один зависший убивал его целиком. Повторяем только сетевые ошибки;
+    отказ самого трекера (HTTPError) возвращаем как есть — его разбирает вызвавший.
+    Повтор безопасен: GET идемпотентен, а мутации идут с version и дедупликацией."""
+    last = None
+    for attempt in range(tries):
+        r = urllib.request.Request(base()+"/api/v1"+path, method=method,
+                                   data=json.dumps(body).encode() if body is not None else None)
+        r.add_header("Authorization", "Bearer " + (token or tok()))
+        if body is not None: r.add_header("Content-Type", "application/json")
+        if nopage: r.add_header("x-disable-pagination", "True")
+        try:
+            with urllib.request.urlopen(r, timeout=45) as x:
+                t = x.read().decode(); return x.status, (json.loads(t) if t.strip() else None)
+        except urllib.error.HTTPError as e:
+            t = e.read().decode()
+            try: return e.code, json.loads(t)
+            except Exception: return e.code, t[:300]
+        except Exception as e:
+            last = e
+            if attempt < tries - 1: time.sleep(2 * (attempt + 1))
+    die(f"сеть после {tries} попыток: {last}")
 
 def do_refresh(quiet=False):
     f = C.ref_f if C.ref_f.is_file() else DEF_REF
