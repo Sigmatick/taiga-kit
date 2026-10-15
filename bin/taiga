@@ -1407,7 +1407,69 @@ def digest_text(name, d, kind):
         L.append("Ничего не требует внимания.")
     return "\n".join(L)
 
+
+def digest_install(args):
+    """Два задания: утренний план и вечерний итог, оба шлют всем получателям."""
+    exe = str(pathlib.Path(sys.argv[0]).resolve())
+    jobs = [("morning", args.at, []), ("evening", args.evening_at, ["--evening"])]
+    if sys.platform == "win32":
+        for name, when, extra in jobs:
+            tn = f"TaigaKitDigest{name.capitalize()}"
+            if args.uninstall:
+                subprocess.run(["schtasks","/Delete","/TN",tn,"/F"], capture_output=True); continue
+            hh, _, mm = when.partition(":")
+            cmd = f'"{sys.executable}" "{exe}" digest --all --send ' + " ".join(extra)
+            r = subprocess.run(["schtasks","/Create","/TN",tn,"/TR",cmd,"/SC","WEEKLY",
+                                "/D","MON,TUE,WED,THU,FRI","/ST",f"{int(hh):02d}:{int(mm or 0):02d}","/F"],
+                               capture_output=True, text=True)
+            if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
+        ok("расписание рассылки поставлено" if not args.uninstall else "рассылка снята"); return
+    if sys.platform != "darwin":
+        ok(f"для cron:\n  30 8 * * 1-5  {exe} digest --all --send"
+           f"\n  30 18 * * 1-5 {exe} digest --all --send --evening"); return
+    log = HOME / ".taiga-kit"; log.mkdir(parents=True, exist_ok=True)
+    for name, when, extra in jobs:
+        label = f"kz.taiga-kit.digest-{name}"
+        plist = HOME / "Library" / "LaunchAgents" / f"{label}.plist"
+        if args.uninstall:
+            subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+            if plist.exists(): plist.unlink()
+            continue
+        hh, _, mm = when.partition(":")
+        try: hh, mm = int(hh), int(mm or 0)
+        except ValueError: die(f"время в виде ЧЧ:ММ, получено «{when}»")
+        days = "".join(f"    <dict><key>Weekday</key><integer>{d}</integer>"
+                       f"<key>Hour</key><integer>{hh}</integer><key>Minute</key><integer>{mm}</integer></dict>\n"
+                       for d in range(1, 6))
+        extra_xml = "".join(f"<string>{x}</string>" for x in extra)
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{exe}</string><string>digest</string>
+  <string>--all</string><string>--send</string>{extra_xml}</array>
+  <key>StartCalendarInterval</key>
+  <array>
+{days}  </array>
+  <key>StandardOutPath</key><string>{log}/digest.log</string>
+  <key>StandardErrorPath</key><string>{log}/digest.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+""")
+        subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+        r = subprocess.run(["launchctl","load",str(plist)], capture_output=True, text=True)
+        if r.returncode: die(f"launchctl {label}: {r.stderr.strip()}")
+    if args.uninstall: ok("рассылка снята с расписания"); return
+    ok(f"рассылка поставлена: будни, план в {args.at}, итог в {args.evening_at}")
+    ok(f"журнал: {log}/digest.log")
+    ok("снять: taiga digest --uninstall")
+
 def cmd_digest(args):
+    if args.install or args.uninstall: return digest_install(args)
     auth()
     kind = "evening" if args.evening else "morning"
     rec = cfg_load().get("telegram_recipients", {})
@@ -1621,6 +1683,10 @@ def main():
     dg.add_argument("--whoami", action="store_true", help="по себе")
     dg.add_argument("--evening", action="store_true", help="вечерний итог вместо утреннего плана")
     dg.add_argument("--send", action="store_true", help="отправить в Telegram, а не печатать")
+    dg.add_argument("--install", action="store_true", help="расписание: будни, план утром, итог вечером")
+    dg.add_argument("--uninstall", action="store_true")
+    dg.add_argument("--at", default="08:30", metavar="ЧЧ:ММ", help="время утреннего плана")
+    dg.add_argument("--evening-at", default="18:30", metavar="ЧЧ:ММ", help="время вечернего итога")
     dg.set_defaults(fn=cmd_digest)
     tg = P("telegram")
     tg.add_argument("--discover", action="store_true", help="кто писал боту: имена и chat_id")

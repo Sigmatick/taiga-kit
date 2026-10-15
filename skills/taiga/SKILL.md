@@ -235,6 +235,10 @@ taiga telegram                     что настроено
 taiga telegram --discover          кто писал боту: имена и chat_id
 taiga telegram --add "Имя" 12345   связать человека с чатом
 taiga telegram --test              проверочное сообщение всем
+
+taiga digest --install             расписание: будни, план 08:30, итог 18:30
+taiga digest --install --at 09:00 --evening-at 19:00
+taiga digest --uninstall           снять
 ```
 
 **Бот не может написать первым.** Каждый получатель сам находит бота в Telegram и шлёт ему

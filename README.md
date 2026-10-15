@@ -231,7 +231,7 @@ taiga triage [--days N] [--all] [--comment]
 taiga report [--day ГГГГ-ММ-ДД] [--install [--at ЧЧ:ММ] [--all-days] |--uninstall]
        [--set-dir ПУТЬ]      куда складывать отчёты (запоминается)
                           отчёт за предыдущий рабочий день + триаж
-taiga digest [--to ИМЯ|--all] [--evening] [--send]
+taiga digest [--to ИМЯ|--all] [--evening] [--send] [--install [--at ЧЧ:ММ --evening-at ЧЧ:ММ]]
                           персональная сводка: своё открытое, зависшее, новое ничьё
 taiga telegram [--discover|--add ИМЯ CHAT_ID|--test]
                           рассылка сводок в Telegram
