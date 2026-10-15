@@ -233,6 +233,9 @@ taiga report [--day ГГГГ-ММ-ДД] [--install [--at ЧЧ:ММ] [--all-days]
                           отчёт за предыдущий рабочий день + триаж
 taiga digest [--to ИМЯ|--all] [--evening] [--send] [--install [--at ЧЧ:ММ --evening-at ЧЧ:ММ]]
                           персональная сводка: своё открытое, зависшее, новое ничьё
+taiga standup [--day ГГГГ-ММ-ДД] [--only ИМЯ] [--send] [--install [--at ЧЧ:ММ]|--uninstall]
+       [--pm-project СЛАГ]   проект с карточками дейликов
+                          вечерняя сводка «план против факта»
 taiga notify [--baseline|--dry] [--max N]
                           адресно: «вам назначена карточка» в BUG/ToDo
 taiga telegram [--discover|--add ИМЯ CHAT_ID|--test]

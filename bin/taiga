@@ -1080,6 +1080,376 @@ def report_install(args):
     ok(f"папка: {reports_dir()}")
     ok("снять: taiga report --uninstall")
 
+def scan_day(start, end, projects=None, users=None):
+    """Переходы статусов и созданное за окно [start, end) по всем проектам.
+
+    Закрытость берётся из КАТАЛОГА статусов проекта, а не из поля is_closed
+    объекта: поле устаревает после переименования статуса (проверено —
+    расходится примерно на 5% объектов). Общая для отчёта и вечерней сводки,
+    чтобы цифры в них не разъезжались."""
+    import datetime
+    _d = lambda s: datetime.datetime.fromisoformat(s.replace("Z","+00:00")) if s else None
+    if users is None:
+        c, users_raw = api("GET", "/users")
+        users = {u["id"]: (u.get("full_name_display") or u.get("username")) for u in (users_raw or [])}
+    if projects is None:
+        c, projects = api("GET", "/projects")
+        if projects == []: die("список проектов пуст при подтверждённой личности — подозрительно")
+    scan = start - datetime.timedelta(days=2)
+    events, created = [], []
+    for p in (projects or []):
+        pid, pname = p["id"], p["name"]
+        cat = {}
+        for kind, ep, api_name in (("us","userstory-statuses","userstory"),
+                                   ("task","task-statuses","task"),
+                                   ("issue","issue-statuses","issue")):
+            c, objs = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
+            touched = [o for o in (objs or []) if _d(o.get("modified_date")) and _d(o["modified_date"]) >= scan]
+            if touched and kind not in cat:
+                c, st = api("GET", f"/{ep}?project={pid}")
+                for s in (st or []): cat[(kind, s["name"])] = s.get("is_closed", False)
+            for o in touched:
+                cd = _d(o.get("created_date"))
+                if cd and start <= cd < end:
+                    created.append({"project": pname, "slug": p.get("slug"), "kind": kind,
+                                    "ref": o["ref"], "subject": o["subject"], "at": o["created_date"],
+                                    "who": users.get(o["owner"], f"id {o['owner']}")})
+                c, h = api("GET", f"/history/{api_name}/{o['id']}")
+                for e in (h or []):
+                    vd = e.get("values_diff") or {}
+                    if "status" not in vd: continue
+                    tm = _d(e["created_at"])
+                    if not (start <= tm < end): continue
+                    events.append({"project": pname, "slug": p.get("slug"), "kind": kind,
+                                   "ref": o["ref"], "subject": o["subject"], "at": e["created_at"],
+                                   "who": (e.get("user") or {}).get("name") or "?",
+                                   "from": vd["status"][0], "to": vd["status"][1],
+                                   "to_closed": cat.get((kind, vd["status"][1]), False),
+                                   "from_closed": cat.get((kind, vd["status"][0]), False)})
+    return events, created, users, projects
+
+
+# ── вечерняя сводка «план против факта» ─────────────────────────────────────
+# План берётся из карточек «Чек-статус» проекта руководителей, факт — из
+# журнала переходов. Разбор описания намеренно снисходительный: регламент
+# есть, но карточки заполняют люди, и падать из-за лишней звёздочки сводка
+# не должна. Чего разобрать не удалось — перечисляется прямым текстом,
+# а не замалчивается: пустая сводка и сводка по неразобранной карточке
+# выглядят одинаково, и это опасно.
+STANDUP_PROJECT = "projectmanager"
+CHECK_RE = re.compile(r"^Чек-статус\s+(?:пн|вт|ср|чт|пт|сб|вс)\s+(\d{2})\.(\d{2})\.(\d{4})\s*[—–-]\s*(.+?)\s*$")
+LINK_RE  = re.compile(r"https?://[^\s)\]]+/project/([a-zA-Z0-9][\w.-]*)/(us|task|issue|epic)/(\d+)")
+BARE_RE  = re.compile(r"(?<![\w/#])#(\d{1,6})\b")
+_MARK    = lambda n: re.compile(r"^\s*[*_]{0,2}\s*" + str(n) + r"\s*\\?[.)]")
+M_DONE, M_PLAN, M_Q = _MARK(1), _MARK(2), _MARK(3)
+_JUNK = ("итоги", "решения", "блокеры", "цели недели", "риски", "результат",
+         "задачи —", "пункт «план»", "ежедневный", "каждый участник", "запишите")
+
+def _su_name(line, nxt=""):
+    """Строка — заголовок участника? Возвращает имя или None."""
+    s = line.strip()
+    m = re.match(r"^#{1,6}\s*(.+?)\s*$", s)
+    if m: s = m.group(1).strip()
+    mu = re.match(r"^[*_]{0,2}\s*Участник:?\s*(.+?)\s*[*_]{0,2}$", s)
+    if mu:
+        s = mu.group(1)                        # «**Участник: Артур Виденмаер**»
+    elif re.match(r"^[*_]{0,2}[A-Za-zА-ЯЁа-яё][^:|]{1,40}:[*_]{0,2}\s*$", s):
+        pass                                   # «Леонид:» — стиль одного из PM
+    elif (len(s) <= 40 and s and not s[0].isdigit() and ":" not in s
+          and not LINK_RE.search(s) and (M_DONE.match(nxt) or _MARK(1).match(nxt))):
+        pass                                   # имя строкой, следом «1. …»
+    else:
+        return None
+    s = re.sub(r"^\**\s*Участник:?\s*", "", s).strip(" *_:")
+    if not s or set(s) <= set("_ -—.") or len(s) > 48: return None
+    if any(s.lower().startswith(j) for j in _JUNK): return None
+    if s.lower().startswith(("что сделано", "что планируется", "какие есть")): return None
+    return s
+
+def r_body(r):
+    """Короткая врезка прозаического плана: видно, что человек написал,
+    и видно, почему это не сверить с трекером."""
+    t = " ".join((r.get("body") or "").split())
+    return (t[:110] + "…") if len(t) > 110 else (t or "—")
+
+def standup_parse(desc):
+    """Описание чек-статуса → список участников с планом."""
+    lines = (desc or "").splitlines()
+    blocks, cur = [], None
+    for i, ln in enumerate(lines):
+        nxt = next((x for x in lines[i+1:i+3] if x.strip()), "")
+        nm = _su_name(ln, nxt)
+        if nm is not None:
+            cur = {"name": nm, "done": [], "plan": [], "q": [], "_sec": None}
+            blocks.append(cur); continue
+        if cur is None: continue
+        low = ln.strip().lower()
+        if M_DONE.match(ln) or low.startswith(("сделано", "**сделано")): cur["_sec"] = "done"
+        elif M_PLAN.match(ln) or low.startswith(("план", "**план")):     cur["_sec"] = "plan"
+        elif M_Q.match(ln) or low.startswith(("вопрос", "**вопрос")):    cur["_sec"] = "q"
+        if cur["_sec"]: cur[cur["_sec"]].append(ln)
+    out = []
+    for b in blocks:
+        txt = "\n".join(b["plan"])
+        links = [(s.lower(), k, int(r)) for s, k, r in LINK_RE.findall(txt)]
+        seen, uniq = set(), []
+        for x in links:
+            if x not in seen: seen.add(x); uniq.append(x)
+        bare = sorted({int(r) for r in BARE_RE.findall(txt)})
+        body = re.sub(r"^\s*[*_]{0,2}\s*2\s*\\?[.)]\s*", "", txt.strip())
+        body = re.sub(r"^[*_]*\s*(Что планируется делать|Планируется|План)\s*[:?]?",
+                      "", body, flags=re.I)
+        body = body.strip(" *_:—-.\n")        # остался шаблон без ответа — считаем пустым
+        out.append({"name": b["name"], "links": uniq, "bare": bare, "body": body,
+                    "plan_text": txt.strip(), "done_text": "\n".join(b["done"]).strip()})
+    return out
+
+def standup_people(users_raw):
+    return [{"id": u["id"], "display": u.get("full_name_display") or u.get("username") or "",
+             "username": (u.get("username") or "")} for u in (users_raw or [])]
+
+def standup_match(name, people):
+    """Имя из карточки → человек в Taiga. Неуверенно — лучше никак."""
+    n = name.strip().lower()
+    if not n: return None
+    for p in people:
+        if p["display"].lower() == n or p["username"].lower() == n: return p
+    words = [w for w in re.split(r"\s+", n) if w]
+    hit = [p for p in people
+           if n in p["display"].lower() or n in p["username"].lower()
+           or (words and all(any(w == d for d in p["display"].lower().split()) for w in words))]
+    return hit[0] if len(hit) == 1 else None
+
+def standup_lookup(slug, kind, ref, cache):
+    """Текущее состояние карточки по слагу/роду/номеру. Закрытость — из каталога."""
+    key = (slug, kind)
+    if slug not in cache["pid"]:
+        c, p = api("GET", f"/projects/by_slug?slug={slug}")
+        cache["pid"][slug] = (p or {}).get("id") if c == 200 else None
+        cache["pname"][slug] = (p or {}).get("name") or slug
+    pid = cache["pid"][slug]
+    if not pid: return None
+    if key not in cache["cat"]:
+        c, st = api("GET", f"/{KINDS[kind][2]}?project={pid}")
+        cache["cat"][key] = {s["id"]: (s["name"], s.get("is_closed", False)) for s in (st or [])}
+    c, o = api("GET", f"/{KINDS[kind][0]}/by_ref?ref={ref}&project={pid}")
+    if c != 200 or not o: return None
+    nm, closed = cache["cat"][key].get(o["status"], ("?", False))
+    return {"project": cache["pname"][slug], "slug": slug, "kind": kind, "ref": ref,
+            "subject": o.get("subject") or "", "status": nm, "closed": closed}
+
+def cmd_standup(args):
+    import datetime
+    if args.install or args.uninstall: return standup_install(args)
+    auth()
+    TZ = datetime.datetime.now().astimezone().tzinfo
+    day = datetime.date.fromisoformat(args.day) if args.day else datetime.datetime.now(TZ).date()
+    start_l = datetime.datetime(day.year, day.month, day.day, tzinfo=TZ)
+    end_l = start_l + datetime.timedelta(days=1)
+    start, end = start_l.astimezone(datetime.timezone.utc), end_l.astimezone(datetime.timezone.utc)
+    slug = args.pm_project or cfg_load().get("standup_project", STANDUP_PROJECT)
+
+    c, pr = api("GET", f"/projects/by_slug?slug={slug}")
+    if c != 200 or not pr: die(f"проект руководителей «{slug}» не найден (сменить: --pm-project)")
+    pid = pr["id"]
+    c, st = api("GET", f"/userstory-statuses?project={pid}")
+    scat = {s["id"]: (s["name"], s.get("is_closed", False)) for s in (st or [])}
+    c, cards = api("GET", f"/userstories?project={pid}", nopage=True)
+    if cards == []: die("в проекте руководителей пусто при подтверждённой личности — подозрительно")
+
+    want = f"{day:%d}.{day:%m}.{day:%Y}"
+    todays = []
+    for o in (cards or []):
+        m = CHECK_RE.match((o.get("subject") or "").strip())
+        if not m: continue
+        if f"{m.group(1)}.{m.group(2)}.{m.group(3)}" != want: continue
+        c2, full = api("GET", f"/userstories/{o['id']}")
+        todays.append({"ref": o["ref"], "pm": m.group(4).strip(),
+                       "status": scat.get(o["status"], ("?", False))[0],
+                       "done": scat.get(o["status"], ("?", False))[1],
+                       "desc": (full or {}).get("description") or ""})
+    todays.sort(key=lambda x: x["pm"])
+    if args.only:
+        todays = [t for t in todays if args.only.lower() in t["pm"].lower()]
+
+    c, users_raw = api("GET", "/users")
+    people = standup_people(users_raw)
+    events, created, users, projects = scan_day(start, end)
+    cache = {"pid": {}, "pname": {}, "cat": {}}
+    moved = {}                               # (slug, kind, ref) → переходы за день
+    for e in events:
+        moved.setdefault((str(e["slug"]).lower(), e["kind"], e["ref"]), []).append(e)
+    closed_by = {}                           # кто что закрыл за день
+    for e in events:
+        if e["to_closed"] and not e["from_closed"]:
+            closed_by.setdefault(e["who"], []).append(e)
+
+    blocks = []
+    for t in todays:
+        parts, probs = standup_parse(t["desc"]), []
+        if not t["done"]: probs.append(f"карточка не в Done (сейчас {t['status']}) — план не зафиксирован")
+        if not parts: probs.append("блоки по участникам не выделены — разобрать нечего")
+        rows = []
+        for p in parts:
+            who = standup_match(p["name"], people)
+            items, inplan = [], set()
+            for s, k, r in p["links"]:
+                it = standup_lookup(s, k, r, cache)
+                if not it:
+                    items.append({"bad": f"{s}/{k}/{r} — такой карточки нет"}); continue
+                inplan.add((s, k, r))
+                ev = moved.get((s, k, r), [])
+                it["moved"] = ev
+                it["done"] = any(x["to_closed"] and not x["from_closed"] for x in ev) or it["closed"]
+                items.append(it)
+            extra = []
+            if who:
+                for e in closed_by.get(who["display"], []):
+                    if (str(e["slug"]).lower(), e["kind"], e["ref"]) not in inplan: extra.append(e)
+            rows.append({"name": p["name"], "who": who, "items": items, "extra": extra,
+                         "bare": p["bare"],
+                         "body": p["body"],
+                         "empty": not p["links"] and not p["bare"] and not p["body"],
+                         "prose": not p["links"] and not p["bare"] and bool(p["body"])})
+        blocks.append({"pm": t["pm"], "ref": t["ref"], "status": t["status"],
+                       "rows": rows, "probs": probs})
+
+    L = [f"# План против факта · {day:%d.%m.%Y}", "",
+         f"Сформировано {datetime.datetime.now(TZ):%H:%M} · план — из карточек «Чек-статус» "
+         f"проекта {pr.get('name') or slug}, факт — из журнала переходов.", ""]
+    if not todays:
+        L += [f"**Карточек «Чек-статус» на {day:%d.%m.%Y} не нашлось.**", "",
+              "Либо дейлики не заводились, либо названия отличаются от "
+              "`Чек-статус <дн> ДД.ММ.ГГГГ — <ПМ>`."]
+    for b in blocks:
+        L += [f"## {b['pm']} · #{b['ref']} · {b['status']}", ""]
+        for pb in b["probs"]: L.append(f"> {pb}")
+        if b["probs"]: L.append("")
+        if not b["rows"]: continue
+        L += ["| Участник | В плане | Закрыто | Сдвинулось | Не тронуто | Сверх плана |",
+              "|---|---:|---:|---:|---:|---:|"]
+        for r in b["rows"]:
+            good = [i for i in r["items"] if not i.get("bad")]
+            dn = len([i for i in good if i["done"]])
+            mv = len([i for i in good if i["moved"] and not i["done"]])
+            note = " _прозой_" if r["prose"] else (" _пусто_" if r["empty"] else "")
+            L.append(f"| {r['name']}{note} | {len(good)} | {dn} | {mv} | "
+                     f"{len(good)-dn-mv} | {len(r['extra'])} |")
+        L.append("")
+        for r in b["rows"]:
+            L.append(f"**{r['name']}**" + ("" if r["who"] else "  ← в Taiga такого человека не нашёл"))
+            if r["empty"]: L.append("- план не заполнен")
+            elif r["prose"]: L.append(f"- план прозой, без ссылок — сверить не с чем: {r_body(r)}")
+            for i in r["items"]:
+                if i.get("bad"): L.append(f"- ❓ {i['bad']}"); continue
+                mark = "✅" if i["done"] else ("▶" if i["moved"] else "⏸")
+                tail = (" · ".join(f"{x['from']} → {x['to']}" for x in i["moved"][-2:])
+                        if i["moved"] else i["status"])
+                L.append(f"- {mark} {i['project']} #{i['ref']} · {i['subject'][:48]} · {tail}")
+            if r["bare"]:
+                L.append(f"- ❓ номера без ссылок, проект не определить: "
+                         + ", ".join(f"#{x}" for x in r["bare"][:8]))
+            for e in r["extra"]:
+                L.append(f"- ➕ сверх плана: {e['project']} #{e['ref']} · {e['subject'][:48]} → {e['to']}")
+            L.append("")
+    rd = reports_dir(); rd.mkdir(parents=True, exist_ok=True)
+    out = rd / f"План-факт_{day:%Y-%m-%d}.md"
+    out.write_text("\n".join(L) + "\n")
+    ok(str(out))
+    for b in blocks:
+        tot = sum(len([i for i in r["items"] if not i.get("bad")]) for r in b["rows"])
+        dn  = sum(len([i for i in r["items"] if not i.get("bad") and i["done"]]) for r in b["rows"])
+        ex  = sum(len(r["extra"]) for r in b["rows"])
+        ok(f"  {b['pm']:<22} в плане {tot:>3}, закрыто {dn:>3}, сверх плана {ex:>3}"
+           + ("  ⚠ " + "; ".join(b["probs"]) if b["probs"] else ""))
+    if not blocks: ok("  карточек на этот день нет")
+    if args.send:
+        rec = cfg_load().get("telegram_recipients", {})
+        for b in blocks:
+            tgt = next((v for v in rec.values() if b["pm"].lower() in (v.get("name") or "").lower()
+                        or (v.get("name") or "").lower() in b["pm"].lower()), None)
+            if not tgt: ok(f"  {b['pm']}: нет связанного чата — не отправлено"); continue
+            r = tg_call("sendMessage", {"chat_id": tgt["chat_id"], "text": standup_tg(b, day),
+                                        "disable_web_page_preview": True})
+            ok(f"  {b['pm']}: {'отправлено' if r.get('ok') else 'ОШИБКА ' + str(r.get('description'))}")
+    return out
+
+def standup_tg(b, day):
+    L = [f"План против факта · {day:%d.%m}", ""]
+    for pb in b["probs"]: L.append(f"⚠ {pb}")
+    if b["probs"]: L.append("")
+    for r in b["rows"]:
+        good = [i for i in r["items"] if not i.get("bad")]
+        dn = len([i for i in good if i["done"]])
+        tag = " · план пуст" if r["empty"] else (" · план прозой, без ссылок" if r["prose"] else "")
+        L.append(f"{r['name']}: {dn} из {len(good)}{tag}")
+        for i in good:
+            if i["done"]: continue
+            mark = "▶" if i["moved"] else "⏸"
+            L.append(f"  {mark} {i['project']} #{i['ref']} · {i['subject'][:40]} · {i['status']}")
+        for e in r["extra"][:4]:
+            L.append(f"  ➕ {e['project']} #{e['ref']} · {e['subject'][:40]}")
+        if r["bare"]: L.append(f"  ❓ без ссылок: " + ", ".join(f"#{x}" for x in r["bare"][:6]))
+    if not b["rows"]: L.append("Карточка не разобрана: блоки по участникам не выделены.")
+    return "\n".join(L)
+
+STANDUP_LABEL = "kz.taiga-kit.standup"
+
+def standup_install(args):
+    exe = str(pathlib.Path(sys.argv[0]).resolve())
+    if sys.platform == "win32":
+        name = "TaigaKitStandup"
+        if args.uninstall:
+            r = subprocess.run(["schtasks","/Delete","/TN",name,"/F"], capture_output=True, text=True)
+            ok("расписание снято" if not r.returncode else f"schtasks: {r.stdout}{r.stderr}"); return
+        hh, _, mm = args.at.partition(":")
+        r = subprocess.run(["schtasks","/Create","/TN",name,
+                            "/TR",f'"{sys.executable}" "{exe}" standup --send',
+                            "/SC","WEEKLY","/D","MON,TUE,WED,THU,FRI",
+                            "/ST",f"{int(hh):02d}:{int(mm or 0):02d}","/F"], capture_output=True, text=True)
+        if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
+        ok(f"расписание поставлено: «{name}», {hh}:{int(mm or 0):02d}"); return
+    if sys.platform != "darwin":
+        ok(f"для cron:  0 19 * * 1-5  {exe} standup --send >> ~/.taiga-kit/standup.log 2>&1"); return
+    plist = HOME / "Library" / "LaunchAgents" / f"{STANDUP_LABEL}.plist"
+    if args.uninstall:
+        subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+        if plist.exists(): plist.unlink()
+        ok(f"расписание снято: {plist}"); return
+    log = HOME / ".taiga-kit"; log.mkdir(parents=True, exist_ok=True)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    hh, _, mm = args.at.partition(":")
+    try: hh, mm = int(hh), int(mm or 0)
+    except ValueError: die("время в виде ЧЧ:ММ, например 19:00")
+    if not (0 <= hh <= 23 and 0 <= mm <= 59): die("часы 0–23, минуты 0–59")
+    days = "".join(f"    <dict><key>Weekday</key><integer>{d}</integer>"
+                   f"<key>Hour</key><integer>{hh}</integer><key>Minute</key><integer>{mm}</integer></dict>\n"
+                   for d in range(1, 6))
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{STANDUP_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{exe}</string><string>standup</string><string>--send</string></array>
+  <key>StartCalendarInterval</key>
+  <array>
+{days}  </array>
+  <key>StandardOutPath</key><string>{log}/standup.log</string>
+  <key>StandardErrorPath</key><string>{log}/standup.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+""")
+    subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+    r = subprocess.run(["launchctl","load",str(plist)], capture_output=True, text=True)
+    if r.returncode: die(f"launchctl: {r.stderr.strip()}")
+    ok(f"расписание поставлено: {plist}")
+    ok(f"будни в {hh:02d}:{mm:02d} · сводка за текущий день, рассылка руководителям")
+    ok(f"папка: {reports_dir()}")
+    ok("снять: taiga standup --uninstall")
+
+
 def cmd_report(args):
     import datetime
     if args.set_dir:
@@ -1109,43 +1479,7 @@ def cmd_report(args):
     _d = lambda s: datetime.datetime.fromisoformat(s.replace("Z","+00:00")) if s else None
     loc = lambda s: _d(s).astimezone(TZ)
 
-    c, users_raw = api("GET", "/users")
-    users = {u["id"]: (u.get("full_name_display") or u.get("username")) for u in (users_raw or [])}
-    c, projects = api("GET", "/projects")
-    if projects == []: die("список проектов пуст при подтверждённой личности — подозрительно")
-
-    scan = start - datetime.timedelta(days=2)
-    events, created = [], []
-    for p in (projects or []):
-        pid, pname = p["id"], p["name"]
-        cat = {}
-        for kind, ep, api_name in (("us","userstory-statuses","userstory"),
-                                   ("task","task-statuses","task"),
-                                   ("issue","issue-statuses","issue")):
-            c, objs = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
-            touched = [o for o in (objs or []) if _d(o.get("modified_date")) and _d(o["modified_date"]) >= scan]
-            if touched and kind not in cat:
-                c, st = api("GET", f"/{ep}?project={pid}")
-                for s in (st or []): cat[(kind, s["name"])] = s.get("is_closed", False)
-            for o in touched:
-                cd = _d(o.get("created_date"))
-                if cd and start <= cd < end:
-                    created.append({"project": pname, "kind": kind, "ref": o["ref"],
-                                    "subject": o["subject"], "at": o["created_date"],
-                                    "who": users.get(o["owner"], f"id {o['owner']}")})
-                c, h = api("GET", f"/history/{api_name}/{o['id']}")
-                for e in (h or []):
-                    vd = e.get("values_diff") or {}
-                    if "status" not in vd: continue
-                    tm = _d(e["created_at"])
-                    if not (start <= tm < end): continue
-                    events.append({"project": pname, "kind": kind, "ref": o["ref"],
-                                   "subject": o["subject"], "at": e["created_at"],
-                                   "who": (e.get("user") or {}).get("name") or "?",
-                                   "from": vd["status"][0], "to": vd["status"][1],
-                                   "to_closed": cat.get((kind, vd["status"][1]), False),
-                                   "from_closed": cat.get((kind, vd["status"][0]), False)})
-
+    events, created, users, projects = scan_day(start, end)
     keys = sorted({(e["who"], e["project"]) for e in events} | {(x["who"], x["project"]) for x in created})
     title = (f"{start_l:%d.%m.%Y}" if (end_l - start_l).days == 1
              else f"{start_l:%d.%m} – {end_l - datetime.timedelta(days=1):%d.%m.%Y}")
@@ -1276,25 +1610,60 @@ def tg_call(method, payload=None):
         except Exception: return {"ok": False, "description": f"HTTP {e.code}"}
     except Exception as e: return {"ok": False, "description": str(e)}
 
+
+def tg_poll(quiet=True):
+    """Собрать написавших боту и ЗАПОМНИТЬ. Telegram держит непрочитанные
+    обновления около суток: не опросили — факт подписки потерян навсегда.
+    Поэтому опрос запоминает в конфиг и вызывается ежечасно дозорным."""
+    import datetime
+    d = tg_call("getUpdates")
+    if not d.get("ok"): return 0, d.get("description")
+    known = cfg_load().get("telegram_seen", {})
+    new = 0
+    for u in d.get("result", []):
+        m = u.get("message") or u.get("edited_message") or {}
+        c = m.get("chat") or {}
+        cid = c.get("id")
+        if not cid: continue
+        k = str(cid)
+        if k in known: continue
+        known[k] = {"name": " ".join(x for x in (c.get("first_name"), c.get("last_name")) if x) or "—",
+                    "username": c.get("username") or "",
+                    "first_seen": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+        new += 1
+        # Человек нажал Start и получил тишину — решит, что сломалось.
+        # Отвечаем сразу, как только увидели подписку.
+        tg_call("sendMessage", {"chat_id": cid, "text":
+            "Вы подписаны на уведомления Taiga.\n\n"
+            "Будет приходить:\n"
+            "— утром план: что на вас открыто и что зависло\n"
+            "— вечером итог: что закрыли за день\n"
+            "— сразу, когда на вас назначат карточку в BUG или ToDo\n\n"
+            "Пока администратор не свяжет ваш чат с учётной записью Taiga, "
+            "сообщений не будет. Это делается вручную — напишите ему, что подписались."})
+    if new: cfg_set("telegram_seen", known)
+    return new, None
+
 def cmd_telegram(args):
     if args.discover:
-        d = tg_call("getUpdates")
-        if not d.get("ok"): die(f"Telegram: {d.get('description')}")
-        seen = {}
-        for u in d.get("result", []):
-            m = u.get("message") or u.get("edited_message") or {}
-            c = m.get("chat") or {}
-            if c.get("id"):
-                seen[c["id"]] = " ".join(x for x in (c.get("first_name"), c.get("last_name"),
-                                                     f"@{c['username']}" if c.get("username") else "") if x)
+        n, err = tg_poll()
+        if err: die(f"Telegram: {err}")
+        seen = cfg_load().get("telegram_seen", {})
+        rec = cfg_load().get("telegram_recipients", {})
+        linked = {str(v["chat_id"]) for v in rec.values()}
         if not seen:
-            ok("никто ещё не писал боту.")
-            ok("Каждый получатель должен найти бота в Telegram и отправить ему любое сообщение —")
-            ok("иначе бот не имеет права писать первым. После этого повторите команду.")
+            ok("боту ещё никто не писал.")
+            ok("Получатель должен найти бота и отправить ему любое сообщение —")
+            ok("иначе бот не имеет права писать первым.")
             return
-        ok("писали боту:")
-        for cid, who in seen.items(): ok(f"  {cid:<14} {who}")
-        ok("\nсвязать: taiga telegram --add \"Фамилия в Taiga\" <chat_id>")
+        if n: ok(f"новых с прошлой проверки: {n}\n")
+        ok(f"{'CHAT_ID':<14}{'КТО В TELEGRAM':<28}{'ПОДПИСАЛСЯ':<14}СВЯЗАН С TAIGA")
+        for cid, v in sorted(seen.items(), key=lambda kv: kv[1].get("first_seen","")):
+            who = v["name"] + (f" @{v['username']}" if v.get("username") else "")
+            tie = next((r["name"] for r in rec.values() if str(r["chat_id"]) == cid), "— нет")
+            ok(f"{cid:<14}{who[:27]:<28}{v.get('first_seen','')[5:16]:<14}{tie}")
+        waiting = [c for c in seen if c not in linked]
+        if waiting: ok(f"\nне связаны: {len(waiting)}. Связать: taiga telegram --add \"Фамилия\" <chat_id>")
         return
     if args.add:
         name, cid = args.add
@@ -1703,6 +2072,12 @@ def cmd_watch(args):
             for ref, subj, fn, body in made: fn.write_text(body)
             st[slug] = {"last": now.isoformat(), "folder": str(tri.parent.parent)}
         state_save(st)
+        # Подписки на бота живут в Telegram около суток: опрашиваем ежечасно,
+        # иначе человек напишет боту ночью, а к утру факт исчезнет.
+        if pathlib.Path(os.path.expanduser(cfg_load().get("telegram_token_file",
+                                                          str(TG_TOKEN_FILE)))).is_file():
+            n, _ = tg_poll()
+            if n: ok(f"новых подписок на бота: {n} (см. `taiga telegram --discover`)")
     if lines and not made_total:
         ok("\n".join(lines))                      # предупреждения не глотаем
     if made_total:
@@ -1771,6 +2146,15 @@ def main():
     dg.add_argument("--at", default="08:30", metavar="ЧЧ:ММ", help="время утреннего плана")
     dg.add_argument("--evening-at", default="18:30", metavar="ЧЧ:ММ", help="время вечернего итога")
     dg.set_defaults(fn=cmd_digest)
+    su = P("standup")
+    su.add_argument("--day", help="конкретная дата ГГГГ-ММ-ДД, по умолчанию сегодня")
+    su.add_argument("--only", metavar="ИМЯ", help="только по одному руководителю")
+    su.add_argument("--pm-project", metavar="СЛАГ", help="проект с карточками дейликов")
+    su.add_argument("--send", action="store_true", help="разослать руководителям в Telegram")
+    su.add_argument("--install", action="store_true", help="расписание: будни 19:00")
+    su.add_argument("--uninstall", action="store_true")
+    su.add_argument("--at", default="19:00", metavar="ЧЧ:ММ", help="время запуска")
+    su.set_defaults(fn=cmd_standup)
     nt = P("notify"); nt.add_argument("--dry", action="store_true", help="показать, не отправляя")
     nt.add_argument("--baseline", action="store_true",
                     help="пометить всё нынешнее как известное, ничего не отправляя")
