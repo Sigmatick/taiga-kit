@@ -1498,6 +1498,89 @@ def cmd_digest(args):
         else:
             ok("─" * 52); ok(txt); ok("")
 
+
+# ── адресные уведомления: «вам назначена карточка» ──────────────────────────
+# Отдельно от сводок: те по расписанию, эти по событию. Повторно об одном и том
+# же не пишем — состояние хранит тройку (проект, номер, исполнитель, статус).
+NOTIFY_STATE = HOME / ".taiga-kit" / "notify-state.json"
+
+def cmd_notify(args):
+    auth()
+    rec = cfg_load().get("telegram_recipients", {})
+    if not rec: die("получателей нет — см. `taiga telegram --discover`")
+    want = {s.lower() for s in cfg_load().get("watch_statuses", ["BUG","Bug (reopen)","ToDo"])}
+    seen = {}
+    if NOTIFY_STATE.is_file():
+        try: seen = json.loads(NOTIFY_STATE.read_text())
+        except json.JSONDecodeError: seen = {}
+
+    c, projects = api("GET", "/projects")
+    fresh, sent, skipped = [], 0, 0
+    for p in (projects or []):
+        pid, pname, pslug = p["id"], p["name"], p["slug"]
+        for kind, ep, web in (("us","userstory-statuses","us"),
+                              ("task","task-statuses","task"),
+                              ("issue","issue-statuses","issue")):
+            c, st = api("GET", f"/{ep}?project={pid}")
+            names = {s["id"]: s["name"] for s in (st or [])}
+            if not (want & {n.lower() for n in names.values()}): continue
+            c, objs = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
+            for o in (objs or []):
+                a = o.get("assigned_to")
+                if not a or str(a) not in rec: continue
+                nm = names.get(o["status"], "")
+                if nm.lower() not in want: continue
+                key = f"{pslug}/{kind}/{o['ref']}/{a}/{o['status']}"
+                if key in seen: skipped += 1; continue
+                fresh.append({"key": key, "uid": str(a), "name": rec[str(a)]["name"],
+                              "chat": rec[str(a)]["chat_id"], "pr": pname,
+                              "ref": o["ref"], "st": nm, "kind": kind,
+                              "subj": o["subject"],
+                              "url": f"{base()}/project/{pslug}/{web}/{o['ref']}"})
+
+    if args.baseline:
+        for x in fresh: seen[x["key"]] = True
+        NOTIFY_STATE.parent.mkdir(parents=True, exist_ok=True)
+        NOTIFY_STATE.write_text(json.dumps(seen, ensure_ascii=False))
+        ok(f"отсечка поставлена: {len(fresh)} уже назначенных карточек помечены как известные.")
+        ok("Ничего не отправлено. Уведомления пойдут только о том, что появится дальше.")
+        return
+    if not fresh:
+        ok(f"новых назначений нет (уже отмечено: {skipped})"); return
+    if len(fresh) > int(args.max):
+        die(f"к отправке {len(fresh)} карточек — больше порога {args.max}.\n"
+            f"       Так бывает при первом запуске: сейчас в работе 120+ назначенных карточек,\n"
+            f"       и люди получили бы по два десятка сообщений разом.\n"
+            f"       Сначала `taiga notify --baseline` — пометить существующее и слать только новое.")
+    byuser = {}
+    for x in fresh: byuser.setdefault(x["uid"], []).append(x)
+    for uid, items in byuser.items():
+        who = items[0]["name"]
+        head = "Вам назначена карточка:" if len(items) == 1 else f"Вам назначено карточек: {len(items)}"
+        lines = [head, ""]
+        for x in items[:10]:
+            lines.append(f"{x['pr']} #{x['ref']} · {x['st']}")
+            lines.append(f"{x['subj'][:80]}")
+            lines.append(x["url"]); lines.append("")
+        if len(items) > 10: lines.append(f"…и ещё {len(items)-10}")
+        txt = "\n".join(lines).strip()
+        if args.dry:
+            ok(f"── {who} ──"); ok(txt); ok(""); continue
+        r = tg_call("sendMessage", {"chat_id": items[0]["chat"], "text": txt,
+                                    "disable_web_page_preview": True})
+        if r.get("ok"):
+            sent += len(items)
+            for x in items: seen[x["key"]] = True
+            ok(f"{who}: отправлено {len(items)}")
+        else:
+            ok(f"{who}: ОШИБКА {r.get('description')} — отметку не ставлю, повторим позже")
+    if not args.dry:
+        NOTIFY_STATE.parent.mkdir(parents=True, exist_ok=True)
+        NOTIFY_STATE.write_text(json.dumps(seen, ensure_ascii=False))
+        ok(f"\nразослано карточек: {sent}")
+    else:
+        ok("(сухой прогон — ничего не отправлено, отметки не поставлены)")
+
 def cmd_watch(args):
     import datetime
     if args.install or args.uninstall: return watch_install(args)
@@ -1688,6 +1771,11 @@ def main():
     dg.add_argument("--at", default="08:30", metavar="ЧЧ:ММ", help="время утреннего плана")
     dg.add_argument("--evening-at", default="18:30", metavar="ЧЧ:ММ", help="время вечернего итога")
     dg.set_defaults(fn=cmd_digest)
+    nt = P("notify"); nt.add_argument("--dry", action="store_true", help="показать, не отправляя")
+    nt.add_argument("--baseline", action="store_true",
+                    help="пометить всё нынешнее как известное, ничего не отправляя")
+    nt.add_argument("--max", default="15", help="предохранитель: больше за раз не слать")
+    nt.set_defaults(fn=cmd_notify)
     tg = P("telegram")
     tg.add_argument("--discover", action="store_true", help="кто писал боту: имена и chat_id")
     tg.add_argument("--add", nargs=2, metavar=("ИМЯ","CHAT_ID"), help="связать человека с чатом")
