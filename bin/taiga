@@ -1242,6 +1242,191 @@ def cmd_report(args):
         notify("Taiga: отчёт готов", f"За {title}: создано {tot[0]}, закрыто {tot[2]}")
     return out
 
+
+# ── Telegram: персональные сводки ───────────────────────────────────────────
+# Один бот, у каждого получателя свой чат. Токен — в отдельном файле с правами
+# 600, в конфиге только путь. Бот не может написать первым: человек должен сам
+# начать диалог, и это же служит его согласием на рассылку.
+TG_TOKEN_FILE = HOME / ".taiga-kit" / "telegram.token"
+
+def tg_token():
+    p = pathlib.Path(os.path.expanduser(cfg_load().get("telegram_token_file", str(TG_TOKEN_FILE))))
+    if not p.is_file() or not p.read_text().strip():
+        die(f"нет токена бота ({p}). Создайте бота у @BotFather и положите токен туда")
+    return p.read_text().strip()
+
+def tg_call(method, payload=None):
+    url = f"https://api.telegram.org/bot{tg_token()}/{method}"
+    data = json.dumps(payload).encode() if payload else None
+    r = urllib.request.Request(url, data=data, method="POST" if data else "GET")
+    if data: r.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(r, timeout=30) as x: return json.loads(x.read().decode())
+    except urllib.error.HTTPError as e:
+        try: return json.loads(e.read().decode())
+        except Exception: return {"ok": False, "description": f"HTTP {e.code}"}
+    except Exception as e: return {"ok": False, "description": str(e)}
+
+def cmd_telegram(args):
+    if args.discover:
+        d = tg_call("getUpdates")
+        if not d.get("ok"): die(f"Telegram: {d.get('description')}")
+        seen = {}
+        for u in d.get("result", []):
+            m = u.get("message") or u.get("edited_message") or {}
+            c = m.get("chat") or {}
+            if c.get("id"):
+                seen[c["id"]] = " ".join(x for x in (c.get("first_name"), c.get("last_name"),
+                                                     f"@{c['username']}" if c.get("username") else "") if x)
+        if not seen:
+            ok("никто ещё не писал боту.")
+            ok("Каждый получатель должен найти бота в Telegram и отправить ему любое сообщение —")
+            ok("иначе бот не имеет права писать первым. После этого повторите команду.")
+            return
+        ok("писали боту:")
+        for cid, who in seen.items(): ok(f"  {cid:<14} {who}")
+        ok("\nсвязать: taiga telegram --add \"Фамилия в Taiga\" <chat_id>")
+        return
+    if args.add:
+        name, cid = args.add
+        c, users = api("GET", "/users")
+        hit = [u for u in (users or []) if name.lower() in (u.get("full_name_display") or "").lower()]
+        if not hit: die(f"«{name}» не найден среди людей инстанса — см. `taiga users`")
+        if len(hit) > 1: die("подходят несколько: " + ", ".join(u["full_name_display"] for u in hit))
+        rec = cfg_load().get("telegram_recipients", {})
+        rec[str(hit[0]["id"])] = {"chat_id": int(cid), "name": hit[0]["full_name_display"]}
+        cfg_set("telegram_recipients", rec)
+        ok(f"связано: {hit[0]['full_name_display']} (id {hit[0]['id']}) → чат {cid}")
+        return
+    if args.remove:
+        rec = cfg_load().get("telegram_recipients", {})
+        gone = [k for k, v in rec.items() if args.remove.lower() in (v.get("name") or "").lower()]
+        if not gone: die(f"«{args.remove}» в списке получателей нет")
+        for k in gone: ok(f"убран: {rec.pop(k)['name']}")
+        cfg_set("telegram_recipients", rec); return
+    if args.test:
+        rec = cfg_load().get("telegram_recipients", {})
+        if not rec: die("получателей нет — см. `taiga telegram --discover`")
+        for uid, v in rec.items():
+            r = tg_call("sendMessage", {"chat_id": v["chat_id"],
+                                        "text": "Проверка связи от taiga-kit. Если видите это — всё работает."})
+            ok(f"  {v['name']:<24} {'отправлено' if r.get('ok') else 'ОШИБКА: ' + str(r.get('description'))}")
+        return
+    rec = cfg_load().get("telegram_recipients", {})
+    tf = cfg_load().get("telegram_token_file", str(TG_TOKEN_FILE))
+    ok(f"токен: {tf} {'(есть)' if pathlib.Path(os.path.expanduser(tf)).is_file() else '— НЕТ'}")
+    ok(f"получателей: {len(rec)}")
+    for uid, v in rec.items(): ok(f"  {v['name']:<26} чат {v['chat_id']}")
+    if not rec: ok("\nдобавить: taiga telegram --discover, затем --add")
+
+
+# ── персональная сводка ─────────────────────────────────────────────────────
+def digest_data(uid, need_closed=False):
+    """Что собрать по одному человеку: его открытое, зависшее, вчерашнее."""
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    TZl = datetime.datetime.now().astimezone().tzinfo
+    today = datetime.datetime.now(TZl).replace(hour=0, minute=0, second=0, microsecond=0)
+    prev = today - datetime.timedelta(days=1)
+    while prev.weekday() >= 5: prev -= datetime.timedelta(days=1)
+    w_from, w_to = prev.astimezone(datetime.timezone.utc), today.astimezone(datetime.timezone.utc)
+    _d = lambda s: datetime.datetime.fromisoformat(s.replace("Z","+00:00")) if s else None
+
+    mine, stuck, closed_y, fresh = [], [], [], []
+    c, projects = api("GET", "/projects")
+    for p in (projects or []):
+        pid, pname = p["id"], p["name"]
+        for kind, key, ep, api_name in (("us","userstories","userstory-statuses","userstory"),
+                                        ("task","tasks","task-statuses","task"),
+                                        ("issue","issues","issue-statuses","issue")):
+            c, st = api("GET", f"/{ep}?project={pid}")
+            cat = {s["id"]: (s["name"], s.get("is_closed", False)) for s in (st or [])}
+            c, objs = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
+            for o in (objs or []):
+                nm, closed = cat.get(o["status"], ("?", False))
+                age = (now - _d(o["modified_date"])).days if o.get("modified_date") else 0
+                rec = {"pr": pname, "ref": o["ref"], "st": nm, "subj": o["subject"], "age": age}
+                if o.get("assigned_to") == uid and not closed:
+                    mine.append(rec)
+                    if "progress" in nm.lower() and age >= 7: stuck.append(rec)
+                cd = _d(o.get("created_date"))
+                if cd and w_from <= cd < w_to and not o.get("assigned_to"): fresh.append(rec)
+                # журнал читаем только для вечернего итога и только по тронутым
+                # в окне: иначе это сотни запросов и минуты ожидания
+                if need_closed and closed and o.get("modified_date") and _d(o["modified_date"]) >= w_from:
+                    c2, h = api("GET", f"/history/{api_name}/{o['id']}")
+                    for e in (h or []):
+                        vd = e.get("values_diff") or {}
+                        if "status" not in vd: continue
+                        tm = _d(e["created_at"])
+                        if not (w_from <= tm < w_to): continue
+                        if (e.get("user") or {}).get("pk") == uid and cat.get(o["status"], ("",False))[1]:
+                            closed_y.append(rec); break
+    return {"mine": mine, "stuck": stuck, "closed": closed_y, "fresh": fresh,
+            "period": f"{prev:%d.%m}"}
+
+def digest_text(name, d, kind):
+    import datetime
+    L = [f"Taiga · {name} · {datetime.datetime.now().astimezone():%a %d.%m}", ""]
+    if kind == "evening":
+        if d["closed"]:
+            L.append(f"Закрыли сегодня: {len(d['closed'])}")
+            for r in d["closed"][:6]: L.append(f"  {r['pr']} #{r['ref']} · {r['subj'][:46]}")
+        else:
+            L.append("Сегодня ничего не закрыто.")
+        inwork = [r for r in d["mine"] if "progress" in r["st"].lower()]
+        if inwork:
+            L.append("")
+            L.append(f"Остаётся в работе: {len(inwork)}")
+            for r in sorted(inwork, key=lambda x: -x["age"])[:5]:
+                L.append(f"  {r['pr']} #{r['ref']} · {r['age']}д · {r['subj'][:42]}")
+        return "\n".join(L)
+    # утро
+    L.append(f"На вас открыто: {len(d['mine'])}")
+    for r in sorted(d["mine"], key=lambda x: -x["age"])[:6]:
+        L.append(f"  {r['pr']} #{r['ref']} · {r['st']} · {r['age']}д · {r['subj'][:40]}")
+    if len(d["mine"]) > 6: L.append(f"  …и ещё {len(d['mine'])-6}")
+    if d["stuck"]:
+        L += ["", f"Зависло в работе ≥7 дней: {len(d['stuck'])}"]
+        for r in sorted(d["stuck"], key=lambda x: -x["age"])[:4]:
+            L.append(f"  {r['pr']} #{r['ref']} · {r['age']}д · {r['subj'][:40]}")
+    if d["fresh"]:
+        L += ["", f"Новые без исполнителя за {d['period']}: {len(d['fresh'])}"]
+        for r in d["fresh"][:5]:
+            L.append(f"  {r['pr']} #{r['ref']} · {r['subj'][:44]}")
+    if not d["mine"] and not d["stuck"] and not d["fresh"]:
+        L.append("Ничего не требует внимания.")
+    return "\n".join(L)
+
+def cmd_digest(args):
+    auth()
+    kind = "evening" if args.evening else "morning"
+    rec = cfg_load().get("telegram_recipients", {})
+    if args.whoami or (not args.all and not args.to):
+        uid, name = IDENTITY["id"], (IDENTITY.get("full_name_display") or IDENTITY["username"])
+        targets = [(uid, name, (rec.get(str(uid)) or {}).get("chat_id"))]
+    elif args.to:
+        c, users = api("GET", "/users")
+        hit = [u for u in (users or []) if args.to.lower() in (u.get("full_name_display") or "").lower()]
+        if not hit: die(f"«{args.to}» не найден")
+        if len(hit) > 1: die("подходят несколько: " + ", ".join(u["full_name_display"] for u in hit))
+        u = hit[0]
+        targets = [(u["id"], u["full_name_display"], (rec.get(str(u["id"])) or {}).get("chat_id"))]
+    else:
+        if not rec: die("получателей нет — см. `taiga telegram --discover`")
+        targets = [(int(k), v["name"], v["chat_id"]) for k, v in rec.items()]
+
+    for uid, name, chat in targets:
+        txt = digest_text(name, digest_data(uid, need_closed=(kind == "evening")), kind)
+        if args.send:
+            if not chat:
+                ok(f"{name}: чат не связан, пропущено"); continue
+            r = tg_call("sendMessage", {"chat_id": chat, "text": txt,
+                                        "disable_web_page_preview": True})
+            ok(f"{name}: {'отправлено' if r.get('ok') else 'ОШИБКА ' + str(r.get('description'))}")
+        else:
+            ok("─" * 52); ok(txt); ok("")
+
 def cmd_watch(args):
     import datetime
     if args.install or args.uninstall: return watch_install(args)
@@ -1421,6 +1606,19 @@ def main():
     w.add_argument("--statuses", metavar="СПИСОК",
                    help="какие статусы брать, через запятую; пусто — любые (запоминается)")
     w.set_defaults(fn=cmd_watch)
+    dg = P("digest")
+    dg.add_argument("--to", metavar="ИМЯ", help="сводка по конкретному человеку")
+    dg.add_argument("--all", action="store_true", help="по всем получателям")
+    dg.add_argument("--whoami", action="store_true", help="по себе")
+    dg.add_argument("--evening", action="store_true", help="вечерний итог вместо утреннего плана")
+    dg.add_argument("--send", action="store_true", help="отправить в Telegram, а не печатать")
+    dg.set_defaults(fn=cmd_digest)
+    tg = P("telegram")
+    tg.add_argument("--discover", action="store_true", help="кто писал боту: имена и chat_id")
+    tg.add_argument("--add", nargs=2, metavar=("ИМЯ","CHAT_ID"), help="связать человека с чатом")
+    tg.add_argument("--remove", metavar="ИМЯ", help="убрать получателя")
+    tg.add_argument("--test", action="store_true", help="отправить всем проверочное сообщение")
+    tg.set_defaults(fn=cmd_telegram)
     rg = P("registry"); rg.add_argument("--forget", metavar="СЛАГ", help="убрать проект из реестра")
     rg.add_argument("--scan", nargs="?", const="", metavar="ПУТЬ",
                     help="найти уже подключённые проекты и внести в реестр")
