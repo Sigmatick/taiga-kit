@@ -7,7 +7,7 @@
 
 Секрет в конфиг не пишется никогда — только путь к нему.
 """
-import argparse, getpass, json, os, re, sys, time, pathlib, subprocess, urllib.request, urllib.error
+import argparse, getpass, json, os, re, shutil, sys, time, pathlib, subprocess, urllib.request, urllib.error
 
 HOME = pathlib.Path.home()
 DEF_URL, DEF_TOK, DEF_REF = HOME/".taiga.url", HOME/".taiga.token", HOME/".taiga.refresh"
@@ -922,6 +922,45 @@ _не заполнено_
 
 LAUNCH_LABEL = "kz.taiga-kit.watch"
 
+
+# ── расписание через cron: всё, что не macOS и не Windows ───────────────────
+# Метка в конце строки — для оболочки комментарий, для нас опознавательный
+# знак. По ней и только по ней ищем свои строки при переустановке: чужой
+# crontab трогать нельзя, его писал человек.
+CRON_MARK = "# taiga-kit:"
+
+def cron_read():
+    r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    return (r.stdout or "").splitlines() if r.returncode == 0 else []
+
+def cron_write(lines):
+    body = "\n".join(l for l in lines if l.strip()) + "\n"
+    r = subprocess.run(["crontab", "-"], input=body, capture_output=True, text=True)
+    if r.returncode: die(f"crontab: {(r.stderr or r.stdout).strip()}")
+
+def cron_job(tag, jobs, uninstall=False):
+    """jobs — список пар (расписание cron, аргументы программы)."""
+    exe = str(pathlib.Path(sys.argv[0]).resolve())
+    log = HOME / ".taiga-kit" / f"{tag}.log"
+    line = lambda a: f"{sys.executable} {exe} {' '.join(a)} >> {log} 2>&1"
+    if not shutil.which("crontab"):
+        if uninstall: ok("crontab на этой системе нет — снимать нечего"); return
+        ok("crontab не найден. Строки для вашего планировщика:")
+        for spec, a in jobs: ok(f"  {spec}  {line(a)}")
+        return
+    keep = [l for l in cron_read() if not l.rstrip().endswith(CRON_MARK + tag)]
+    if uninstall:
+        cron_write(keep); ok(f"строки «{tag}» убраны из crontab"); return
+    log.parent.mkdir(parents=True, exist_ok=True)
+    for spec, a in jobs: keep.append(f"{spec} {line(a)} {CRON_MARK}{tag}")
+    cron_write(keep)
+    ok(f"расписание поставлено в crontab:")
+    for spec, a in jobs: ok(f"  {spec}  taiga {' '.join(a)}")
+    ok(f"журнал: {log}")
+    ok(f"снять: taiga {tag} --uninstall")
+
+def cron_days(all_days): return "*" if all_days else "1-5"
+
 def watch_install(args):
     """Расписание дозорного. macOS — launchd; на другом — подсказка для cron."""
     exe = str((pathlib.Path(sys.argv[0]).resolve()))
@@ -947,9 +986,9 @@ def watch_install(args):
         ok("снять: taiga watch --uninstall")
         return
     if sys.platform != "darwin":
-        ok("автоустановка расписания есть для macOS и Windows. Для cron добавьте строку:")
-        ok(f"  5 9-19 * * 1-5  {exe} watch >> ~/.taiga-kit/watch.log 2>&1")
-        return
+        h_from, h_to, every = int(args.start), int(args.end), max(1, int(args.every))
+        return cron_job("watch", [(f"5 {h_from}-{h_to}/{every} * * {cron_days(args.all_days)}",
+                                   ["watch"])], args.uninstall)
     plist = HOME / "Library" / "LaunchAgents" / f"{LAUNCH_LABEL}.plist"
     if args.uninstall:
         subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
@@ -1039,7 +1078,9 @@ def report_install(args):
         if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
         ok(f"расписание поставлено: задание «{name}», {hh}:{int(mm or 0):02d}"); return
     if sys.platform != "darwin":
-        ok(f"для cron:  0 9 * * 1-5  {exe} report >> ~/.taiga-kit/report.log 2>&1"); return
+        hh, _, mm = args.at.partition(":")
+        return cron_job("report", [(f"{int(mm or 0)} {int(hh)} * * {cron_days(args.all_days)}",
+                                    ["report"])], args.uninstall)
     plist = HOME / "Library" / "LaunchAgents" / f"{REPORT_LABEL}.plist"
     if args.uninstall:
         subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
@@ -1410,7 +1451,9 @@ def standup_install(args):
         if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
         ok(f"расписание поставлено: «{name}», {hh}:{int(mm or 0):02d}"); return
     if sys.platform != "darwin":
-        ok(f"для cron:  0 19 * * 1-5  {exe} standup --send >> ~/.taiga-kit/standup.log 2>&1"); return
+        hh, _, mm = args.at.partition(":")
+        return cron_job("standup", [(f"{int(mm or 0)} {int(hh)} * * 1-5",
+                                     ["standup", "--send"])], args.uninstall)
     plist = HOME / "Library" / "LaunchAgents" / f"{STANDUP_LABEL}.plist"
     if args.uninstall:
         subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
@@ -1794,8 +1837,12 @@ def digest_install(args):
             if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
         ok("расписание рассылки поставлено" if not args.uninstall else "рассылка снята"); return
     if sys.platform != "darwin":
-        ok(f"для cron:\n  30 8 * * 1-5  {exe} digest --all --send"
-           f"\n  30 18 * * 1-5 {exe} digest --all --send --evening"); return
+        spec = []
+        for _name, at, extra in jobs:
+            hh, _, mm = at.partition(":")
+            spec.append((f"{int(mm or 0)} {int(hh)} * * 1-5",
+                         ["digest", "--all", "--send"] + extra))
+        return cron_job("digest", spec, args.uninstall)
     log = HOME / ".taiga-kit"; log.mkdir(parents=True, exist_ok=True)
     for name, when, extra in jobs:
         label = f"kz.taiga-kit.digest-{name}"
@@ -1894,7 +1941,8 @@ def notify_install(args):
         if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
         ok(f"расписание поставлено: задание «{name}»"); return
     if sys.platform != "darwin":
-        ok(f"для cron:  15 {h_from}-{h_to} * * 1-5  {exe} notify >> ~/.taiga-kit/notify.log 2>&1"); return
+        return cron_job("notify", [(f"15 {h_from}-{h_to}/{every} * * {cron_days(args.all_days)}",
+                                    ["notify"])], args.uninstall)
     plist = HOME / "Library" / "LaunchAgents" / f"{NOTIFY_LABEL}.plist"
     if args.uninstall:
         subprocess.run(["launchctl","unload",str(plist)], capture_output=True)

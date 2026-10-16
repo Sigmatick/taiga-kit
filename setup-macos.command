@@ -62,7 +62,8 @@ fi
 # ── 3. программа ────────────────────────────────────────────────────────────
 bold "Шаг 3 из 5. Программа taiga"
 mkdir -p "$BIN"
-cp "$SRC/bin/taiga" "$BIN/taiga" && chmod +x "$BIN/taiga"
+cp "$SRC/bin/taiga" "$BIN/taiga" || fail "не удалось скопировать $SRC/bin/taiga"
+chmod +x "$BIN/taiga" || fail "не удалось сделать $BIN/taiga исполняемым"
 echo "  установлена: $BIN/taiga"
 if ! grep -qs '\.local/bin' "$HOME/.zshrc" 2>/dev/null; then
   printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zshrc"

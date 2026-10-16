@@ -5,6 +5,7 @@ Taiga в Claude Code
 
   macOS    двойной щелчок по  setup-macos.command
   Windows  правая кнопка по   setup-windows.ps1  ->  «Выполнить с помощью PowerShell»
+  Linux    в терминале:       bash setup-linux.sh
 
 Установщик сначала спросит, кто вы:
 

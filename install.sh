@@ -8,14 +8,31 @@ ask() { read -r -p "$1 [y/N] " a; [[ "$a" =~ ^([yY]|[дД]а?)$ ]]; }
 
 say "taiga-kit — установка CLI"
 command -v python3 >/dev/null || { echo "нет python3: xcode-select --install"; exit 1; }
-mkdir -p "$BIN"; cp "$SRC/bin/taiga" "$BIN/taiga"; chmod +x "$BIN/taiga"
+mkdir -p "$BIN"
+cp "$SRC/bin/taiga" "$BIN/taiga" || { echo "не удалось скопировать $SRC/bin/taiga"; exit 1; }
+chmod +x "$BIN/taiga"
 echo "установлено: $BIN/taiga"
 
+# Файл настроек той оболочки, которой человек на самом деле пользуется:
+# дописать в .zshrc при bash — значит молча ничего не сделать.
+rcfile() {
+  case "$(basename "${SHELL:-/bin/bash}")" in
+    zsh)  echo "$HOME/.zshrc" ;;
+    fish) echo "$HOME/.config/fish/config.fish" ;;
+    *)    [ -f "$HOME/.bash_profile" ] && echo "$HOME/.bash_profile" || echo "$HOME/.bashrc" ;;
+  esac
+}
+
 if ! command -v taiga >/dev/null 2>&1; then
-  RC="$HOME/.zshrc"
+  RC="$(rcfile)"
   say "Каталог $BIN не в PATH"
   if ask "дописать строку в $RC?"; then
-    printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$RC"
+    mkdir -p "$(dirname "$RC")"
+    if [ "$(basename "$RC")" = "config.fish" ]; then
+      printf '\nset -gx PATH $HOME/.local/bin $PATH\n' >> "$RC"
+    else
+      printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$RC"
+    fi
     echo "дописано — откройте новый терминал"
   fi
   export PATH="$BIN:$PATH"
