@@ -1635,6 +1635,25 @@ def cmd_report(args):
 # начать диалог, и это же служит его согласием на рассылку.
 TG_TOKEN_FILE = HOME / ".taiga-kit" / "telegram.token"
 
+# ── оформление строк в сообщениях ───────────────────────────────────────────
+def st_icon(status):
+    """Значок по колонке. В списке из десяти карточек глаз цепляется
+    за значок раньше, чем успевает прочитать название статуса."""
+    t = (status or "").lower()
+    if "bug" in t or "баг" in t:                       return "\U0001F41E"   # 🐞
+    if "todo" in t or "to do" in t or "к работе" in t: return "\U0001F4CB"   # 📋
+    if "progress" in t or "работе" in t:               return "\u25B6"       # ▶
+    if "test" in t or "тест" in t:                     return "\U0001F9EA"   # 🧪
+    return "\u2022"                                                          # •
+
+def cut(t, n=120):
+    """Обрезать по границе слова. «нет соо» читателю не говорит ничего —
+    лучше потерять слово целиком и честно поставить многоточие."""
+    t = " ".join((t or "").split())
+    if len(t) <= n: return t
+    head = t[:n].rsplit(" ", 1)[0]
+    return (head or t[:n]).rstrip(" ,;:.—-") + "…"
+
 def tg_token():
     p = pathlib.Path(os.path.expanduser(cfg_load().get("telegram_token_file", str(TG_TOKEN_FILE))))
     if not p.is_file() or not p.read_text().strip():
@@ -1792,7 +1811,8 @@ def digest_text(name, d, kind):
     if kind == "evening":
         if d["closed"]:
             L.append(f"Закрыли сегодня: {len(d['closed'])}")
-            for r in d["closed"][:6]: L.append(f"  {r['pr']} #{r['ref']} · {r['subj'][:46]}")
+            for r in d["closed"][:6]:
+                L.append(f"  \u2705 {r['pr']} #{r['ref']} · {cut(r['subj'], 70)}")
         else:
             L.append("Сегодня ничего не закрыто.")
         inwork = [r for r in d["mine"] if "progress" in r["st"].lower()]
@@ -1800,21 +1820,22 @@ def digest_text(name, d, kind):
             L.append("")
             L.append(f"Остаётся в работе: {len(inwork)}")
             for r in sorted(inwork, key=lambda x: -x["age"])[:5]:
-                L.append(f"  {r['pr']} #{r['ref']} · {r['age']}д · {r['subj'][:42]}")
+                L.append(f"  \u25B6 {r['pr']} #{r['ref']} · {r['age']}д · {cut(r['subj'], 66)}")
         return "\n".join(L)
     # утро
     L.append(f"На вас открыто: {len(d['mine'])}")
     for r in sorted(d["mine"], key=lambda x: -x["age"])[:6]:
-        L.append(f"  {r['pr']} #{r['ref']} · {r['st']} · {r['age']}д · {r['subj'][:40]}")
+        L.append(f"  {st_icon(r['st'])} {r['pr']} #{r['ref']} · {r['st']} · {r['age']}д · "
+                 f"{cut(r['subj'], 60)}")
     if len(d["mine"]) > 6: L.append(f"  …и ещё {len(d['mine'])-6}")
     if d["stuck"]:
         L += ["", f"Зависло в работе ≥7 дней: {len(d['stuck'])}"]
         for r in sorted(d["stuck"], key=lambda x: -x["age"])[:4]:
-            L.append(f"  {r['pr']} #{r['ref']} · {r['age']}д · {r['subj'][:40]}")
+            L.append(f"  \u23F3 {r['pr']} #{r['ref']} · {r['age']}д · {cut(r['subj'], 64)}")
     if d["fresh"]:
         L += ["", f"Новые без исполнителя за {d['period']}: {len(d['fresh'])}"]
         for r in d["fresh"][:5]:
-            L.append(f"  {r['pr']} #{r['ref']} · {r['subj'][:44]}")
+            L.append(f"  {st_icon(r['st'])} {r['pr']} #{r['ref']} · {cut(r['subj'], 68)}")
     if not d["mine"] and not d["stuck"] and not d["fresh"]:
         L.append("Ничего не требует внимания.")
     return "\n".join(L)
@@ -2061,8 +2082,8 @@ def cmd_notify(args):
         head = "Вам назначена карточка:" if len(items) == 1 else f"Вам назначено карточек: {len(items)}"
         lines = [head, ""]
         for x in items[:10]:
-            lines.append(f"{x['pr']} #{x['ref']} · {x['st']}")
-            lines.append(f"{x['subj'][:80]}")
+            lines.append(f"{st_icon(x['st'])} {x['pr']} #{x['ref']} · {x['st']}")
+            lines.append(cut(x["subj"], 120))
             lines.append(x["url"]); lines.append("")
         if len(items) > 10: lines.append(f"…и ещё {len(items)-10}")
         txt = "\n".join(lines).strip()
