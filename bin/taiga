@@ -2103,6 +2103,301 @@ def cmd_notify(args):
     else:
         ok("(сухой прогон — ничего не отправлено, отметки не поставлены)")
 
+# ── автоматическая разведка по коду ─────────────────────────────────────────
+# Дозорный кладёт заготовку, разведка её заполняет: ищет место в коде, строит
+# гипотезу, предлагает шаг. Запускает `claude -p` в папке проекта с правом
+# ТОЛЬКО читать. Почему так строго: в репозиториях лежат сотни несохранённых
+# файлов чужой работы, и любая запись туда — чужая потеря.
+RECON_STATE = HOME / ".taiga-kit" / "recon-state.json"
+RECON_WAIT  = "ждёт разведки"
+RECON_DONE  = "разведка готова"
+RECON_FAIL  = "разведка не удалась"
+# Слова, которых разведка права не имеет: она читала код, но не запускала его.
+RECON_BAD = ("подтвердил", "подтвердила", "воспроизвёл", "воспроизвела", "воспроизвел",
+             "причина в том", "причина в ", "баг вызван", "ошибка вызвана")
+
+RECON_PROMPT = """Ты разбираешь тикет трекера по коду этого репозитория. Только чтение.
+
+ТИКЕТ
+{subject}
+{url}
+статус: {st} · исполнитель: {who}
+
+{desc}
+
+ЧТО СДЕЛАТЬ
+Найди в коде место, которого касается тикет. Ответь РОВНО тремя разделами
+в таком виде, без вступления и без заключения:
+
+## Что нашлось в коде
+- путь/к/файлу.ext:НОМЕР — что там происходит
+(от двух до шести пунктов; ссылайся только на файлы, которые ты действительно открыл)
+
+## Гипотеза
+(два–пять предложений)
+
+## Что предлагаю
+(один–четыре пункта: конкретный следующий шаг)
+
+ПРАВИЛА
+- Ты не собирал приложение и не воспроизводил баг. Пиши «судя по коду»,
+  «предположительно». Не пиши «подтвердил», «воспроизвёл», «причина в».
+- Не меняй ни одного файла и не трогай git: в репозитории чужая работа в процессе.
+- Не нашёл — так и напиши, где искал и почему. Выдуманная ссылка на файл хуже
+  честного «не нашёл»: по ней пойдут и потеряют время.
+"""
+
+def recon_state():
+    import datetime
+    today = datetime.date.today().isoformat()
+    d = {}
+    if RECON_STATE.is_file():
+        try: d = json.loads(RECON_STATE.read_text())
+        except json.JSONDecodeError: d = {}
+    if d.get("day") != today: d = {"day": today, "done": 0}
+    return d
+
+def recon_save(d):
+    RECON_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = RECON_STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False)); tmp.replace(RECON_STATE)
+
+def recon_stubs(reg, only_slug=None, only_ref=None):
+    """Заготовки, ждущие разведки. Правленые человеком не берём: статус в них
+    уже не «ждёт разведки», и перезаписать его значило бы стереть чужую работу."""
+    out = []
+    for slug in sorted(reg):
+        if only_slug and slug != only_slug: continue
+        folder = reg_path(slug)
+        tri = (folder / ".claude" / "триаж") if folder else None
+        if not (tri and tri.is_dir()): continue
+        for fn in tri.glob("*.md"):
+            txt = fn.read_text(errors="ignore")
+            if f"статус: {RECON_WAIT}" not in txt: continue
+            m = re.match(r"(\d+)-", fn.name)
+            if not m: continue
+            ref = int(m.group(1))
+            if only_ref and ref != only_ref: continue
+            out.append({"slug": slug, "root": folder, "file": fn, "ref": ref, "text": txt})
+    out.sort(key=lambda x: -x["ref"])              # свежие тикеты вперёд
+    return out
+
+def recon_env():
+    """Окружение для дочернего claude. Переменные нашей сессии ему вредят:
+    ANTHROPIC_BASE_URL указывает на прокси, обновлять токен к которому умеет
+    только десктопное приложение."""
+    e = dict(os.environ)
+    for k in list(e):
+        if k.startswith(("CLAUDE", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH")): e.pop(k, None)
+    return e
+
+def recon_run(stub, timeout, cmd, model=None):
+    """Запустить разведку по одной заготовке. Возвращает (текст, ошибка)."""
+    t = stub["text"]
+    g = lambda pat, d="": (re.search(pat, t, re.M).group(1).strip()
+                           if re.search(pat, t, re.M) else d)
+    body = t.split("## Что в тикете", 1)[-1].split("## Чего не хватает", 1)[0].strip()
+    prompt = RECON_PROMPT.format(
+        subject=g(r"^# (.+)$", f"#{stub['ref']}"),
+        url=g(r"^(https?://\S+)$"),
+        st=g(r"статус в трекере: (.+?) ·", "?"),
+        who=g(r"исполнитель: (.+)$", "?"),
+        desc=body or "_описания в тикете нет_")
+    argv = [cmd, "-p", "--allowedTools", "Read", "Grep", "Glob",
+            "--permission-mode", "default", "--max-turns", "20"]
+    if model: argv += ["--model", model]
+    try:
+        r = subprocess.run(argv, input=prompt, capture_output=True, text=True,
+                           cwd=str(stub["root"]), timeout=timeout, env=recon_env())
+    except subprocess.TimeoutExpired:
+        return None, f"не уложилась в {timeout} с"
+    except FileNotFoundError:
+        return None, f"программа «{cmd}» не найдена"
+    out = (r.stdout or "").strip()
+    if r.returncode != 0:
+        return None, ((r.stderr or out).strip().splitlines() or ["код " + str(r.returncode)])[0][:200]
+    if len(out) < 80: return None, "ответ пустой или слишком короткий"
+    if "## Гипотеза" not in out: return None, "в ответе нет раздела «Гипотеза»"
+    return out, None
+
+def recon_check(out, root):
+    """Проверить ответ: существуют ли названные файлы и нет ли запрещённых слов.
+    Проверяем механически, потому что выдуманная ссылка выглядит убедительно."""
+    bad_refs, seen = [], set()
+    for m in re.finditer(r"([\w./\-]+\.[A-Za-z0-9]{1,6}):(\d+)", out):
+        p = m.group(1)
+        if p in seen: continue
+        seen.add(p)
+        if (root / p).exists(): continue
+        name = pathlib.PurePath(p).name
+        try: found = next(root.rglob(name), None)
+        except Exception: found = None
+        if not found: bad_refs.append(f"{p}:{m.group(2)}")
+    low = out.lower()
+    words = sorted({w.strip() for w in RECON_BAD if w in low})
+    return bad_refs, words
+
+def recon_apply(stub, out, bad_refs, words):
+    """Вписать разведку в заготовку, сохранив шапку и текст тикета."""
+    import datetime
+    t = stub["text"]
+    head = t.split("## Что нашлось в коде", 1)[0].rstrip()
+    warn = []
+    if bad_refs:
+        warn.append("> ⚠ не найдено в репозитории: " + ", ".join(bad_refs[:6])
+                    + ". Ссылкам из этого списка верить нельзя.")
+    if words:
+        warn.append("> ⚠ разведка написала «" + "», «".join(words)
+                    + "», хотя приложение не запускала. Читайте как предположение.")
+    tail = "\n".join(warn) + ("\n\n" if warn else "")
+    body = (f"{head}\n\n{tail}{out.strip()}\n\n"
+            f"_Разведка по коду, {datetime.date.today().isoformat()}. "
+            f"Не проверено запуском._\n")
+    return re.sub(r"^статус: .+$", f"статус: {RECON_DONE}", body, count=1, flags=re.M)
+
+def recon_gist(out, n=3):
+    """Пара строк для сообщения: гипотеза, если она есть."""
+    m = re.search(r"## Гипотеза\s*\n(.+?)(?=\n## |\Z)", out, re.S)
+    txt = " ".join((m.group(1) if m else out).split())
+    return cut(txt, 300)
+
+def cmd_recon(args):
+    import datetime
+    if args.install or args.uninstall: return recon_install(args)
+    reg = reg_load()
+    if not reg: die("реестр пуст — выполните `taiga registry --scan`")
+    cfg = cfg_load()
+    cmd = cfg.get("recon_cmd", "claude")
+    model = cfg.get("recon_model")
+    timeout = int(cfg.get("recon_timeout", 300))
+    per_day = int(args.max_day if args.max_day else cfg.get("recon_max_day", 10))
+    per_run = int(args.max_run if args.max_run else cfg.get("recon_max_run", 3))
+
+    stubs = recon_stubs(reg, args.project, int(args.ref) if args.ref else None)
+    stt = recon_state()
+    left = max(0, per_day - int(stt.get("done", 0)))
+    if not stubs:
+        ok("заготовок, ждущих разведки, нет"); return
+    if not left and not args.ref:
+        ok(f"дневной предел исчерпан: {stt['done']} из {per_day}. "
+           f"Ждут разведки: {len(stubs)}"); return
+    take = stubs if args.ref else stubs[:min(per_run, left)]
+
+    ok(f"ждут разведки: {len(stubs)} · сегодня сделано {stt.get('done',0)} из {per_day} · "
+       f"беру {len(take)}")
+    if args.dry:
+        for s in take: ok(f"  {s['slug']} #{s['ref']} · {s['file'].name}")
+        ok(f"\n(сухой прогон — модель не запускалась)\n"
+           f"команда: {cmd} -p --allowedTools Read Grep Glob --max-turns 20, "
+           f"предел {timeout} с, папка проекта")
+        return
+
+    done = []
+    for s in take:
+        t0 = time.time()
+        out, err = recon_run(s, timeout, cmd, model)
+        secs = int(time.time() - t0)
+        if err:
+            ok(f"  {s['slug']} #{s['ref']}: не вышло — {err}")
+            # Отметку дня не тратим на неудачу: иначе одна сломанная настройка
+            # съест весь дневной предел и разведка встанет до завтра.
+            continue
+        bad, words = recon_check(out, s["root"])
+        s["file"].write_text(recon_apply(s, out, bad, words))
+        stt["done"] = int(stt.get("done", 0)) + 1
+        recon_save(stt)
+        flags = (f" · ⚠ выдуманных ссылок: {len(bad)}" if bad else "") + \
+                (f" · ⚠ запрещённые слова: {len(words)}" if words else "")
+        ok(f"  {s['slug']} #{s['ref']}: готово за {secs} с{flags}")
+        done.append((s, out, bad, words))
+
+    if args.send and done:
+        recon_send(done)
+    if done:
+        notify("Taiga: разведка", f"Разобрано тикетов: {len(done)}")
+    ok(f"разобрано: {len(done)} · остаток дневного предела: "
+       f"{max(0, per_day - int(stt.get('done', 0)))}")
+
+def recon_send(done):
+    """Разослать итог тем, на кого тикет назначен и кто подключён к боту."""
+    rec = cfg_load().get("telegram_recipients", {})
+    if not rec: ok("  получателей нет — не рассылаю"); return
+    by_name = {(v.get("name") or "").lower(): v for v in rec.values()}
+    for s, out, bad, words in done:
+        who = (re.search(r"исполнитель: (.+)$", s["text"], re.M) or [None, ""])[1].strip()
+        tgt = by_name.get(who.lower()) or next(
+            (v for k, v in by_name.items() if who and (who.lower() in k or k in who.lower())), None)
+        if not tgt:
+            ok(f"  #{s['ref']}: «{who or 'не назначена'}» не подключён к боту — не отправлено")
+            continue
+        subj = (re.search(r"^# (.+)$", s["text"], re.M) or [None, ""])[1].strip()
+        url = (re.search(r"^(https?://\S+)$", s["text"], re.M) or [None, ""])[1].strip()
+        lines = [f"\U0001F50E Разведка по коду · #{s['ref']}", cut(subj, 110), "",
+                 recon_gist(out)]
+        if bad: lines += ["", f"⚠ выдуманные ссылки на файлы: {len(bad)} — проверяйте"]
+        lines += ["", url, f"Полностью: {s['file']}"]
+        r = tg_call("sendMessage", {"chat_id": tgt["chat_id"], "text": "\n".join(lines),
+                                    "disable_web_page_preview": True})
+        ok(f"  #{s['ref']} → {tgt['name']}: "
+           f"{'отправлено' if r.get('ok') else 'ОШИБКА ' + str(r.get('description'))}")
+
+RECON_LABEL = "kz.taiga-kit.recon"
+
+def recon_install(args):
+    exe = str(pathlib.Path(sys.argv[0]).resolve())
+    h_from, h_to, every = int(args.start), int(args.end), max(1, int(args.every))
+    if sys.platform == "win32":
+        name = "TaigaKitRecon"
+        if args.uninstall:
+            r = subprocess.run(["schtasks","/Delete","/TN",name,"/F"], capture_output=True, text=True)
+            ok("расписание снято" if not r.returncode else f"schtasks: {r.stdout}{r.stderr}"); return
+        r = subprocess.run(["schtasks","/Create","/TN",name,
+                            "/TR",f'"{sys.executable}" "{exe}" recon --send',
+                            "/SC","WEEKLY","/D","MON,TUE,WED,THU,FRI","/ST",f"{h_from:02d}:35",
+                            "/RI",str(every*60),"/DU",f"{max(1,h_to-h_from):04d}:00","/F"],
+                           capture_output=True, text=True)
+        if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
+        ok(f"расписание поставлено: «{name}»"); return
+    if sys.platform != "darwin":
+        return cron_job("recon", [(f"35 {h_from}-{h_to}/{every} * * 1-5",
+                                   ["recon", "--send"])], args.uninstall)
+    plist = HOME / "Library" / "LaunchAgents" / f"{RECON_LABEL}.plist"
+    if args.uninstall:
+        subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+        if plist.exists(): plist.unlink()
+        ok(f"расписание снято: {plist}"); return
+    log = HOME / ".taiga-kit"; log.mkdir(parents=True, exist_ok=True)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    hours = "".join(f"    <dict><key>Weekday</key><integer>{d}</integer>"
+                    f"<key>Hour</key><integer>{h}</integer><key>Minute</key><integer>35</integer></dict>\n"
+                    for d in range(1, 6) for h in range(h_from, h_to + 1, every))
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{RECON_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{exe}</string><string>recon</string><string>--send</string></array>
+  <key>StartCalendarInterval</key>
+  <array>
+{hours}  </array>
+  <key>StandardOutPath</key><string>{log}/recon.log</string>
+  <key>StandardErrorPath</key><string>{log}/recon.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+""")
+    subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+    r = subprocess.run(["launchctl","load",str(plist)], capture_output=True, text=True)
+    if r.returncode: die(f"launchctl: {r.stderr.strip()}")
+    ok(f"расписание поставлено: {plist}")
+    ok(f"будни, каждые {every} ч с {h_from}:35 до {h_to}:35 · "
+       f"до {cfg_load().get('recon_max_run', 3)} тикетов за раз, "
+       f"{cfg_load().get('recon_max_day', 10)} в сутки")
+    ok(f"журнал: {log}/recon.log")
+    ok("снять: taiga recon --uninstall")
+
+
 def cmd_watch(args):
     import datetime
     if args.install or args.uninstall: return watch_install(args)
@@ -2319,6 +2614,18 @@ def main():
     nt.add_argument("--end", default="19", metavar="Ч", help="по какой час")
     nt.add_argument("--all-days", action="store_true", help="включая выходные")
     nt.set_defaults(fn=cmd_notify)
+    rc = P("recon")
+    rc.add_argument("--ref", help="только один тикет, не тратя дневной предел")
+    rc.add_argument("--max-run", help="сколько тикетов за прогон, по умолчанию 3")
+    rc.add_argument("--max-day", help="сколько тикетов в сутки, по умолчанию 10")
+    rc.add_argument("--dry", action="store_true", help="показать, модель не запускать")
+    rc.add_argument("--send", action="store_true", help="разослать итог в Telegram")
+    rc.add_argument("--install", action="store_true", help="расписание: будни, каждые 2 ч")
+    rc.add_argument("--uninstall", action="store_true")
+    rc.add_argument("--every", default="2", metavar="Ч", help="период, по умолчанию 2 ч")
+    rc.add_argument("--start", default="9", metavar="Ч")
+    rc.add_argument("--end", default="19", metavar="Ч")
+    rc.set_defaults(fn=cmd_recon)
     tg = P("telegram")
     tg.add_argument("--discover", action="store_true", help="кто писал боту: имена и chat_id")
     tg.add_argument("--add", nargs=2, metavar=("ИМЯ","CHAT_ID"), help="связать человека с чатом")
