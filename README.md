@@ -239,6 +239,7 @@ taiga digest [--to ИМЯ|--all] [--evening] [--send] [--install [--at ЧЧ:ММ
 taiga recon [--ref N] [--max-run N] [--max-day N] [--dry] [--send]
        [--install [--every Ч --start Ч --end Ч]|--uninstall]
                           разведка по коду: заполнить заготовки триажа
+taiga notify --column "Ready for test" --watchers "" | --off
 taiga standup [--day ГГГГ-ММ-ДД] [--only ИМЯ] [--send] [--install [--at ЧЧ:ММ]|--uninstall]
        [--pm-project СЛАГ]   проект с карточками дейликов
                           вечерняя сводка «план против факта»

@@ -1291,6 +1291,77 @@ def standup_lookup(slug, kind, ref, cache):
     return {"project": cache["pname"][slug], "slug": slug, "kind": kind, "ref": ref,
             "subject": o.get("subject") or "", "status": nm, "closed": closed}
 
+TEST_COL = "ready for test"
+
+def test_queue(projects):
+    """Сколько карточек сейчас стоит в очереди на проверку, по проектам.
+    Отдельный проход: журнал показывает движение, а не остаток."""
+    out = {}
+    for p in (projects or []):
+        pid, n = p["id"], 0
+        for kind, ep in (("us","userstory-statuses"),("task","task-statuses"),("issue","issue-statuses")):
+            c, st = api("GET", f"/{ep}?project={pid}")
+            ids = {x["id"] for x in (st or []) if x["name"].strip().lower() == TEST_COL}
+            if not ids: continue
+            c, objs = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
+            n += sum(1 for o in (objs or []) if o["status"] in ids)
+        if n: out[p["name"]] = n
+    return out
+
+def test_flow(events):
+    """Движение через колонку проверки за день."""
+    into = [x for x in events if x["to"].lower() == TEST_COL and x["from"].lower() != TEST_COL]
+    out  = [x for x in events if x["from"].lower() == TEST_COL and x["to"].lower() != TEST_COL]
+    passed = [x for x in out if x["to_closed"]]
+    back   = [x for x in out if not x["to_closed"] and "bug" in x["to"].lower()]
+    other  = [x for x in out if x not in passed and x not in back]
+    return into, passed, back, other
+
+def test_block(events, queue):
+    """Раздел для файла сводки. Только арифметика по журналу."""
+    into, passed, back, other = test_flow(events)
+    tot = sum(queue.values())
+    L = ["## Тестирование за день", "",
+         "| | |", "|---|---:|",
+         f"| Ушло на проверку | {len(into)} |",
+         f"| Проверено и закрыто | {len(passed)} |",
+         f"| Вернули в баги | {len(back)} |"]
+    if other: L.append(f"| Ушло из проверки иначе | {len(other)} |")
+    L.append(f"| **Стоит в очереди сейчас** | **{tot}** |")
+    L.append("")
+    delta = len(into) - len(passed) - len(back) - len(other)
+    if delta > 0: L.append(f"Очередь выросла на {delta}: пришло {len(into)}, "
+                           f"разобрано {len(into)-delta}.")
+    elif delta < 0: L.append(f"Очередь сократилась на {-delta}.")
+    else: L.append("Очередь не изменилась.")
+    if queue:
+        L.append("")
+        L.append("В очереди по проектам: " +
+                 ", ".join(f"{k} {v}" for k, v in sorted(queue.items(), key=lambda kv: -kv[1])))
+    for name, rows in (("Ушло на проверку", into), ("Проверено и закрыто", passed),
+                       ("Вернули в баги", back), ("Ушло из проверки иначе", other)):
+        if not rows: continue
+        L += ["", f"### {name} — {len(rows)}", "",
+              "| Время | Проект | # | Название | Кто |", "|---|---|---:|---|---|"]
+        for x in sorted(rows, key=lambda z: z["at"]):
+            L.append(f"| {x['at'][11:16]} | {x['project']} | {x['ref']} "
+                     f"| {cut(x['subject'], 46)} | {x['who']} |")
+    return L
+
+def test_tg(events, queue):
+    """Та же сводка в двух словах, для сообщения руководителю."""
+    into, passed, back, other = test_flow(events)
+    tot = sum(queue.values())
+    L = ["", f"\U0001F9EA Тестирование: ушло {len(into)}, проверено {len(passed)}, "
+             f"вернули {len(back)}", f"в очереди сейчас: {tot}"]
+    if into:
+        top = {}
+        for x in into: top[x["project"]] = top.get(x["project"], 0) + 1
+        L.append("ушло: " + ", ".join(f"{k} {v}" for k, v in sorted(top.items(), key=lambda kv: -kv[1])[:4]))
+    if back:
+        L.append("вернули: " + ", ".join(f"{x['project']} #{x['ref']}" for x in back[:5]))
+    return L
+
 def cmd_standup(args):
     import datetime
     if args.install or args.uninstall: return standup_install(args)
@@ -1405,6 +1476,7 @@ def cmd_standup(args):
             for e in r["extra"]:
                 L.append(f"- ➕ сверх плана: {e['project']} #{e['ref']} · {e['subject'][:48]} → {e['to']}")
             L.append("")
+    L += [""] + test_block(events, test_queue(projects))
     rd = reports_dir(); rd.mkdir(parents=True, exist_ok=True)
     out = rd / f"План-факт_{day:%Y-%m-%d}.md"
     out.write_text("\n".join(L) + "\n")
@@ -1417,12 +1489,14 @@ def cmd_standup(args):
            + ("  ⚠ " + "; ".join(b["probs"]) if b["probs"] else ""))
     if not blocks: ok("  карточек на этот день нет")
     if args.send:
+        tq = test_tg(events, test_queue(projects))
         rec = cfg_load().get("telegram_recipients", {})
         for b in blocks:
             tgt = next((v for v in rec.values() if b["pm"].lower() in (v.get("name") or "").lower()
                         or (v.get("name") or "").lower() in b["pm"].lower()), None)
             if not tgt: ok(f"  {b['pm']}: нет связанного чата — не отправлено"); continue
-            r = tg_call("sendMessage", {"chat_id": tgt["chat_id"], "text": standup_tg(b, day),
+            r = tg_call("sendMessage", {"chat_id": tgt["chat_id"],
+                                        "text": standup_tg(b, day) + "\n" + "\n".join(tq),
                                         "disable_web_page_preview": True})
             ok(f"  {b['pm']}: {'отправлено' if r.get('ok') else 'ОШИБКА ' + str(r.get('description'))}")
     return out
@@ -1696,7 +1770,7 @@ TG_HELP = (
     "проекты все — за всеми\n"
     "проекты — показать, за чем слежу сейчас\n"
     "стоп — отписаться\n"
-    "проекты? — список всех проектов\n\n"
+    "проекты? — выбрать кнопками\n\n"
     "Менять можно в любой момент, просто напишите заново."
 )
 
@@ -1716,8 +1790,8 @@ def tg_cmd(cid, text, slugs, names):
 
     if low in ("помощь", "help", "start", "старт", "?"): return TG_HELP
 
-    if low in ("проекты?", "проекты ?", "список", "projects?"):
-        return "Проекты:\n" + "\n".join(f"{s} — {names[s]}" for s in sorted(slugs))
+    if low in ("проекты?", "проекты ?", "список", "projects?", "выбрать"):
+        return "__BOARD__"
 
     if not (low == "проекты" or low.startswith(("проекты ", "projects"))):
         return None                                   # не команда — молчим
@@ -1748,6 +1822,69 @@ def tg_cmd(cid, text, slugs, names):
     if me.pop("_bad", None): ans += "\nНе понял и пропустил: " + ", ".join(bad)
     return ans
 
+def tg_board(cid, slugs, names):
+    """Текст и клавиатура выбора проектов. Нет записи в подписках — значит
+    человек не подписан, и галочек нет."""
+    sub = subs_load().get(str(cid))
+    if sub is None: chosen = set()
+    elif not (sub.get("projects") or []): chosen = set(slugs)      # пусто = все
+    else: chosen = set(sub["projects"])
+    rows, row = [], []
+    for sl in sorted(slugs):
+        row.append({"text": ("☑ " if sl in chosen else "▫ ") + names[sl][:20],
+                    "callback_data": f"p:{sl}"})
+        if len(row) == 2: rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([{"text": "Все", "callback_data": "p:*all"},
+                 {"text": "Снять все", "callback_data": "p:*none"},
+                 {"text": "Готово", "callback_data": "p:*done"}])
+    if sub is None: head = "Отметьте проекты, за которыми следить."
+    elif not (sub.get("projects") or []): head = "Слежу за всеми проектами."
+    else: head = "Слежу за: " + ", ".join(names.get(x, x) for x in sorted(chosen))
+    return head + "\n\nКарточки присылаю, когда они приходят на проверку.", {"inline_keyboard": rows}
+
+def tg_tap(q, slugs, names):
+    """Нажатие кнопки. Снял последнюю галочку — отписали: подписка
+    на ноль проектов смысла не имеет и выглядела бы как поломка."""
+    msg = q.get("message") or {}
+    cid = (msg.get("chat") or {}).get("id")
+    mid = msg.get("message_id")
+    data = (q.get("data") or "")
+    if not cid or not data.startswith("p:"): return
+    arg = data[2:]
+    subs = subs_load(); key = str(cid)
+    sub = subs.get(key)
+    cur = set(slugs) if (sub is not None and not (sub.get("projects") or [])) \
+          else set((sub or {}).get("projects") or [])
+    note = ""
+    if arg == "*done":
+        tg_call("answerCallbackQuery", {"callback_query_id": q["id"], "text": "Сохранено"})
+        head, _ = tg_board(cid, slugs, names)
+        tg_call("editMessageText", {"chat_id": cid, "message_id": mid,
+                                    "text": head.split("\n\n")[0] + "\n\nМенять — «проекты?»."})
+        return
+    if arg == "*all":
+        subs[key] = {**(sub or {}), "projects": []}; note = "Все проекты"
+    elif arg == "*none":
+        subs.pop(key, None); note = "Отписал"
+    elif arg in slugs:
+        cur.symmetric_difference_update({arg})
+        if not cur: subs.pop(key, None); note = "Отписал"
+        else:
+            subs[key] = {**(sub or {}), "projects": sorted(cur)}
+            note = ("Добавил " if arg in cur else "Убрал ") + names.get(arg, arg)
+    else:
+        return
+    if key in subs and not subs[key].get("name"):
+        c = msg.get("chat") or {}
+        subs[key]["name"] = (" ".join(x for x in (c.get("first_name"), c.get("last_name")) if x)
+                             or c.get("username") or str(cid))
+    subs_save(subs)
+    tg_call("answerCallbackQuery", {"callback_query_id": q["id"], "text": note})
+    head, kb = tg_board(cid, slugs, names)
+    tg_call("editMessageText", {"chat_id": cid, "message_id": mid, "text": head,
+                                "reply_markup": kb})
+
 def tg_poll(quiet=True):
     """Собрать написавших боту и ЗАПОМНИТЬ. Telegram держит непрочитанные
     обновления около суток: не опросили — факт подписки потерян навсегда.
@@ -1767,6 +1904,9 @@ def tg_poll(quiet=True):
     new = 0; last = None
     for u in ups:
         last = max(last or 0, u.get("update_id", 0))
+        if u.get("callback_query"):
+            if slugs: tg_tap(u["callback_query"], slugs, names)
+            continue
         m = u.get("message") or u.get("edited_message") or {}
         c = m.get("chat") or {}
         cid = c.get("id")
@@ -1774,6 +1914,10 @@ def tg_poll(quiet=True):
         k = str(cid)
         if slugs:
             ans = tg_cmd(cid, m.get("text"), slugs, names)
+            if ans == "__BOARD__":
+                head, kb = tg_board(cid, slugs, names)
+                tg_call("sendMessage", {"chat_id": cid, "text": head, "reply_markup": kb})
+                ans = None
             if ans:
                 sb = subs_load()
                 if k in sb and not sb[k].get("name"):
@@ -1794,9 +1938,9 @@ def tg_poll(quiet=True):
             "— утром план: что на вас открыто и что зависло\n"
             "— вечером итог: что закрыли за день\n"
             "— сразу, когда на вас назначат карточку в BUG или ToDo\n\n"
-            "Тестировщикам: напишите «проекты все» или перечислите слаги "
-            "(«проекты domcom, checkpoint») — буду присылать карточки, "
-            "пришедшие на проверку. «помощь» — список команд.\n\n"
+            "Тестировщикам: напишите «проекты?» — покажу список кнопками, "
+            "отметите свои. Буду присылать карточки, пришедшие на проверку. "
+            "«помощь» — все команды.\n\n"
             "Для остального администратор должен связать ваш чат с учётной "
             "записью Taiga — напишите ему, что подписались."})
     if new: cfg_set("telegram_seen", known)
@@ -2212,14 +2356,31 @@ def cmd_notify(args):
     if args.install or args.uninstall: return notify_install(args)
     if args.column:
         cols = cfg_load().get("notify_columns", {})
-        if args.watchers is None:
-            ok(f"колонка «{args.column}»: {', '.join(cols.get(args.column, [])) or 'никто не следит'}")
+        if args.watchers is None and not args.off:
+            if args.column not in cols:
+                ok(f"колонка «{args.column}»: не под наблюдением"); return
+            adm = cols[args.column]
+            sb = subs_load()
+            ok(f"колонка «{args.column}» под наблюдением")
+            ok(f"  список администратора: {', '.join(adm) if adm else 'пуст'}")
+            ok(f"  подписались сами: {len(sb)}")
+            for cid, v in sb.items():
+                p = v.get("projects") or []
+                ok(f"    {v.get('name') or cid}: {'все проекты' if not p else ', '.join(p)}")
             return
+        if args.off:
+            cols.pop(args.column, None); cfg_set("notify_columns", cols)
+            ok(f"колонка «{args.column}»: больше не следим"); return
+        # Пустой список — колонка ПОД наблюдением, просто без списка от
+        # администратора: получатели приходят из самоподписки через бота.
+        # Снять наблюдение совсем — отдельный ключ --off, иначе легко
+        # выключить рассылку, думая что просто убираешь людей.
         names = [x.strip() for x in args.watchers.split(",") if x.strip()]
-        if names: cols[args.column] = names
-        else: cols.pop(args.column, None)
+        cols[args.column] = names
         cfg_set("notify_columns", cols)
-        ok(f"колонка «{args.column}»: {', '.join(names) if names else 'слежение снято'}")
+        n = len(subs_load())
+        ok(f"колонка «{args.column}»: " + (", ".join(names) if names else
+           f"список администратора пуст, получатели только из самоподписки (сейчас их {n})"))
         return
     auth()
     rec = cfg_load().get("telegram_recipients", {})
@@ -2837,7 +2998,8 @@ def main():
     nt.add_argument("--column", metavar="КОЛОНКА",
                     help="следить за колонкой (например «Ready for test»); без --watchers — показать")
     nt.add_argument("--watchers", metavar="ИМЕНА",
-                    help="кому слать про эту колонку, через запятую; пусто — снять слежение")
+                    help="кому слать про эту колонку, через запятую; пусто — только самоподписка")
+    nt.add_argument("--off", action="store_true", help="с --column: перестать следить за колонкой")
     nt.set_defaults(fn=cmd_notify)
     rc = P("recon")
     rc.add_argument("--ref", help="только один тикет, не тратя дневной предел")
