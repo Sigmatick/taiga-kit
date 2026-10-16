@@ -2022,8 +2022,100 @@ def notify_save(seen):
     tmp = NOTIFY_STATE.with_suffix(".tmp")
     tmp.write_text(json.dumps(seen, ensure_ascii=False)); tmp.replace(NOTIFY_STATE)
 
+def notify_columns(args, seen):
+    """Рассылка по КОЛОНКЕ, а не по исполнителю.
+
+    Тестирование у нас живёт в колонке: карточка уходит в «Ready for test»,
+    а поле «исполнитель» остаётся на разработчике, который её передвинул.
+    Поэтому обычное «вам назначена карточка» тестировщика не достаёт — он
+    нигде не исполнитель. Здесь следим за колонкой и шлём названным людям."""
+    cols = cfg_load().get("notify_columns", {})
+    if not cols: return 0
+    rec = cfg_load().get("telegram_recipients", {})
+    by_name = {(v.get("name") or "").lower(): v for v in rec.values()}
+    want = {k.strip().lower(): v for k, v in cols.items()}
+    based = set(seen.get("__col_baselined__") or [])
+    c, users = api("GET", "/users")
+    un = {u["id"]: (u.get("full_name_display") or u.get("username")) for u in (users or [])}
+    c, projects = api("GET", "/projects")
+    fresh = {}
+    for p in (projects or []):
+        pid, pslug, pname = p["id"], p["slug"], p["name"]
+        for kind, ep, web in (("us","userstory-statuses","us"),
+                              ("task","task-statuses","task"),
+                              ("issue","issue-statuses","issue")):
+            c, st = api("GET", f"/{ep}?project={pid}")
+            names = {x["id"]: x["name"] for x in (st or [])}
+            hit = {i: n for i, n in names.items() if n.strip().lower() in want}
+            if not hit: continue
+            c, objs = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
+            for o in (objs or []):
+                if o["status"] not in hit: continue
+                col = hit[o["status"]]
+                key = f"col:{pslug}/{kind}/{o['ref']}/{col}"
+                if key in seen: continue
+                fresh.setdefault(col.strip().lower(), []).append({
+                    "key": key, "col": col, "pr": pname, "ref": o["ref"],
+                    "subj": o["subject"], "holder": un.get(o.get("assigned_to"), "не назначена"),
+                    "url": f"{base()}/project/{pslug}/{web}/{o['ref']}"})
+    sent = 0
+    for col_l, items in fresh.items():
+        col = items[0]["col"]
+        # Первый прогон по колонке: в «Ready for test» лежит под сотню карточек,
+        # и люди получили бы их все разом. Помечаем известными молча.
+        if col_l not in based:
+            for x in items: seen[x["key"]] = True
+            based.add(col_l); seen["__col_baselined__"] = sorted(based)
+            notify_save(seen)
+            ok(f"колонка «{col}»: впервые в рассылке — {len(items)} карточек "
+               f"помечены как известные, сообщений не шлю")
+            continue
+        targets = []
+        for nm in want[col_l]:
+            t = by_name.get(nm.lower()) or next(
+                (v for k, v in by_name.items() if nm.lower() in k), None)
+            if t: targets.append(t)
+            else: ok(f"колонка «{col}»: «{nm}» не подключён к боту — пропускаю")
+        if not targets:
+            ok(f"колонка «{col}»: получателей нет, {len(items)} карточек не отправлено")
+            continue
+        items.sort(key=lambda x: -x["ref"])
+        if len(items) <= 3:
+            msgs = [f"\U0001F9EA В «{col}» · {x['pr']} #{x['ref']}\n{cut(x['subj'], 110)}\n"
+                    f"от: {x['holder']}\n{x['url']}" for x in items]
+        else:
+            L = [f"\U0001F9EA В «{col}» новых карточек: {len(items)}", ""]
+            for x in items[:15]:
+                L += [f"{x['pr']} #{x['ref']} · {cut(x['subj'], 70)}", x["url"], ""]
+            if len(items) > 15: L.append(f"…и ещё {len(items)-15}")
+            msgs = ["\n".join(L).strip()]
+        for t in targets:
+            okall = True
+            for txt in msgs:
+                r = tg_call("sendMessage", {"chat_id": t["chat_id"], "text": txt,
+                                            "disable_web_page_preview": True})
+                if not r.get("ok"):
+                    okall = False
+                    ok(f"  {t['name']}: ОШИБКА {r.get('description')}")
+            if okall: ok(f"  колонка «{col}» → {t['name']}: {len(items)} шт.")
+        for x in items: seen[x["key"]] = True
+        sent += len(items)
+        notify_save(seen)
+    return sent
+
 def cmd_notify(args):
     if args.install or args.uninstall: return notify_install(args)
+    if args.column:
+        cols = cfg_load().get("notify_columns", {})
+        if args.watchers is None:
+            ok(f"колонка «{args.column}»: {', '.join(cols.get(args.column, [])) or 'никто не следит'}")
+            return
+        names = [x.strip() for x in args.watchers.split(",") if x.strip()]
+        if names: cols[args.column] = names
+        else: cols.pop(args.column, None)
+        cfg_set("notify_columns", cols)
+        ok(f"колонка «{args.column}»: {', '.join(names) if names else 'слежение снято'}")
+        return
     auth()
     rec = cfg_load().get("telegram_recipients", {})
     if not rec: die("получателей нет — см. `taiga telegram --discover`")
@@ -2080,7 +2172,10 @@ def cmd_notify(args):
                f"помечены как известные, сообщений не шлю")
         fresh = [x for x in fresh if x["uid"] not in newbies]
     if not fresh:
-        ok(f"новых назначений нет (уже отмечено: {skipped})"); return
+        ok(f"новых назначений нет (уже отмечено: {skipped})")
+        if not args.dry: notify_columns(args, seen)
+        return
+    if not args.dry: notify_columns(args, seen)
     byuser = {}
     for x in fresh: byuser.setdefault(x["uid"], []).append(x)
     for uid, items in byuser.items():
@@ -2634,6 +2729,10 @@ def main():
     nt.add_argument("--start", default="9", metavar="Ч", help="с какого часа")
     nt.add_argument("--end", default="19", metavar="Ч", help="по какой час")
     nt.add_argument("--all-days", action="store_true", help="включая выходные")
+    nt.add_argument("--column", metavar="КОЛОНКА",
+                    help="следить за колонкой (например «Ready for test»); без --watchers — показать")
+    nt.add_argument("--watchers", metavar="ИМЕНА",
+                    help="кому слать про эту колонку, через запятую; пусто — снять слежение")
     nt.set_defaults(fn=cmd_notify)
     rc = P("recon")
     rc.add_argument("--ref", help="только один тикет, не тратя дневной предел")
