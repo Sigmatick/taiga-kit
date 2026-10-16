@@ -218,6 +218,8 @@ taiga ls [--open] [--mine] [--status X] [--kind us|task|issue|epic]
 taiga show <номер>
 
 taiga new "текст" [--kind task --parent N] [--assign имя] [--status X]
+       [--desc "текст"]      описание; \n разворачивается в перенос строки
+       [--desc-file ФАЙЛ]    описание из файла, как есть
 taiga mv <номер> "<статус>"
 taiga assign <номер> <имя>
 taiga comment <номер> "текст"

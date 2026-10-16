@@ -379,10 +379,22 @@ def cmd_new(args):
         _, par = find_item(pid, args.parent, "us"); body["user_story"] = par["id"]
     if args.assign: body["assigned_to"] = resolve_member(pid, args.assign)["user"]
     if args.status: body["status"] = resolve_status(pid, kind, args.status)["id"]
+    if args.desc_file:
+        f = pathlib.Path(os.path.expanduser(args.desc_file))
+        if not f.is_file(): die(f"файл описания не найден: {f}")
+        body["description"] = f.read_text()
+    elif args.desc:
+        # В одну строку командной строки настоящий перенос не вписать,
+        # поэтому \n в тексте разворачиваем в перенос. Длинное описание —
+        # через --desc-file, там текст лежит как есть.
+        body["description"] = args.desc.replace("\\n", "\n")
     c, ex = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
     dup = [i for i in (ex or []) if i["subject"].strip().lower() == args.subject.strip().lower()]
     if dup and not args.force: die(f"уже есть #{dup[0]['ref']} с таким названием — повторить можно с --force")
-    if not confirm(args, f"создать {KINDS[kind][3]} в «{p['name']}»: {args.subject}"): return
+    what = f"создать {KINDS[kind][3]} в «{p['name']}»: {args.subject}"
+    if body.get("description"):
+        what += "\n       описание: " + cut(" ".join(body["description"].split()), 140)
+    if not confirm(args, what): return
     c, r = api("POST", f"/{KINDS[kind][0]}", body)
     if c != 201: die(f"{c}: {r}")
     ok(f"создано #{r['ref']} (id {r['id']})")
@@ -2554,7 +2566,10 @@ def main():
     i = P("init"); i.add_argument("slug"); i.add_argument("--name"); i.add_argument("--here", action="store_true"); i.add_argument("--force", action="store_true"); i.set_defaults(fn=cmd_init)
     l = P("ls"); l.add_argument("--open", action="store_true"); l.add_argument("--mine", action="store_true"); l.add_argument("--status"); l.set_defaults(fn=cmd_ls)
     s = P("show"); s.add_argument("ref"); s.set_defaults(fn=cmd_show)
-    n = P("new"); n.add_argument("subject"); n.add_argument("--parent"); n.add_argument("--assign"); n.add_argument("--status"); n.add_argument("--force", action="store_true"); n.set_defaults(fn=cmd_new)
+    n = P("new"); n.add_argument("subject"); n.add_argument("--parent"); n.add_argument("--assign"); n.add_argument("--status")
+    n.add_argument("--desc", help="описание; \\n разворачивается в перенос строки")
+    n.add_argument("--desc-file", metavar="ФАЙЛ", help="описание из файла, как есть")
+    n.add_argument("--force", action="store_true"); n.set_defaults(fn=cmd_new)
     m = P("mv"); m.add_argument("ref"); m.add_argument("status"); m.set_defaults(fn=cmd_mv)
     a = P("assign"); a.add_argument("ref"); a.add_argument("who"); a.set_defaults(fn=cmd_assign)
     np = P("new-project"); np.add_argument("name"); np.add_argument("--desc", required=True)

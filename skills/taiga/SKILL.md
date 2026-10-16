@@ -19,6 +19,7 @@ taiga projects                     список проектов: слаг, id, 
 taiga ls [--open] [--mine] [--status X] [--kind us|task|issue|epic]
 taiga show <номер>                 карточка + история переходов
 taiga new "текст" [--kind task --parent <номер>] [--assign имя] [--status X]
+                  [--desc "текст"] [--desc-file ФАЙЛ]
 taiga mv <номер> "<статус>"
 taiga assign <номер> <имя>
 taiga comment <номер> "текст"
@@ -30,6 +31,20 @@ taiga login [--here] | refresh     вход и продление токена
 ```
 
 Ключи `-p <слаг>` и `-y` ставятся **после** подкоманды: `taiga ls -p egsv --open`.
+
+## Описание при создании карточки
+
+`--desc` разворачивает `\n` в перенос строки: настоящий перенос в одну строку команды
+не вписать. Длинный текст — `--desc-file ФАЙЛ`, оттуда он берётся как есть.
+
+```
+taiga new "Выделить staging-сервер" --assign "Kovalev" --status ToDo \
+  --desc 'Характеристики:\n\n- 2 vCPU\n- 4 GB RAM\n\nОС: Ubuntu.'
+```
+
+Описание попадает в подтверждение перед записью, сокращённым до одной строки.
+Несколько карточек разом — плановым файлом (`taiga plan` / `taiga apply`), там
+у каждой свои `subject`, `description`, `assign`, `status`.
 
 ## Создание проекта — диалогом
 
