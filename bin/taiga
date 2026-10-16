@@ -1685,21 +1685,102 @@ def tg_call(method, payload=None):
     except Exception as e: return {"ok": False, "description": str(e)}
 
 
+# ── команды боту: человек подписывается сам ─────────────────────────────────
+# Рассылка идёт с машины администратора, поэтому выбор проектов не может
+# лежать у человека на компьютере — центральное задание его не увидит. Общий
+# канал, который есть у обеих сторон, один: бот.
+TG_HELP = (
+    "Я присылаю карточки, пришедшие на проверку.\n\n"
+    "Команды:\n"
+    "проекты domcom, checkpoint — следить за этими проектами\n"
+    "проекты все — за всеми\n"
+    "проекты — показать, за чем слежу сейчас\n"
+    "стоп — отписаться\n"
+    "проекты? — список всех проектов\n\n"
+    "Менять можно в любой момент, просто напишите заново."
+)
+
+def subs_load(): return cfg_load().get("column_subs", {})
+def subs_save(d): cfg_set("column_subs", d)
+
+def tg_cmd(cid, text, slugs, names):
+    """Разобрать сообщение от человека. Возвращает текст ответа или None."""
+    t = " ".join((text or "").split())
+    low = t.lower().lstrip("/")
+    if not low: return None
+    subs = subs_load(); me = subs.get(str(cid), {})
+
+    if low in ("стоп", "stop", "отписка", "отписаться"):
+        if subs.pop(str(cid), None) is None: return "Вы и так не подписаны."
+        subs_save(subs); return "Отписал. Вернуться: напишите «проекты все»."
+
+    if low in ("помощь", "help", "start", "старт", "?"): return TG_HELP
+
+    if low in ("проекты?", "проекты ?", "список", "projects?"):
+        return "Проекты:\n" + "\n".join(f"{s} — {names[s]}" for s in sorted(slugs))
+
+    if not (low == "проекты" or low.startswith(("проекты ", "projects"))):
+        return None                                   # не команда — молчим
+
+    arg = t.split(None, 1)[1].strip() if " " in t else ""
+    if not arg:
+        if not me: return "Вы не подписаны. Напишите «проекты все» или перечислите слаги."
+        p = me.get("projects") or []
+        return ("Слежу за всеми проектами." if not p else
+                "Слежу за: " + ", ".join(names.get(x, x) for x in p)) + "\nСменить: напишите заново."
+
+    if arg.lower() in ("все", "всё", "all", "*"):
+        me["projects"] = []
+    else:
+        want = [x.strip().lower() for x in re.split(r"[,\s]+", arg) if x.strip()]
+        good = [x for x in want if x in slugs]
+        bad = [x for x in want if x not in slugs]
+        if not good:
+            return ("Таких проектов нет: " + ", ".join(bad) + "\n\nЕсть вот эти:\n"
+                    + "\n".join(f"{s} — {names[s]}" for s in sorted(slugs)))
+        me["projects"] = good
+        if bad: me["_bad"] = bad
+    me.setdefault("name", "")
+    subs[str(cid)] = me; subs_save(subs)
+    p = me.get("projects") or []
+    ans = ("Готово. Слежу за всеми проектами."
+           if not p else "Готово. Слежу за: " + ", ".join(names.get(x, x) for x in p))
+    if me.pop("_bad", None): ans += "\nНе понял и пропустил: " + ", ".join(bad)
+    return ans
+
 def tg_poll(quiet=True):
     """Собрать написавших боту и ЗАПОМНИТЬ. Telegram держит непрочитанные
     обновления около суток: не опросили — факт подписки потерян навсегда.
     Поэтому опрос запоминает в конфиг и вызывается ежечасно дозорным."""
     import datetime
-    d = tg_call("getUpdates")
+    # Смещение обязательно: без него Telegram отдаёт одни и те же сообщения
+    # сутки подряд. Команда «стоп» без смещения через час отменилась бы сама.
+    off = cfg_load().get("telegram_offset")
+    d = tg_call("getUpdates" + (f"?offset={off}&timeout=0" if off else ""))
     if not d.get("ok"): return 0, d.get("description")
+    ups = d.get("result", [])
+    slugs, names = set(), {}
+    if ups:
+        c0, pr = api("GET", "/projects")
+        for p in (pr or []): slugs.add(p["slug"]); names[p["slug"]] = p["name"]
     known = cfg_load().get("telegram_seen", {})
-    new = 0
-    for u in d.get("result", []):
+    new = 0; last = None
+    for u in ups:
+        last = max(last or 0, u.get("update_id", 0))
         m = u.get("message") or u.get("edited_message") or {}
         c = m.get("chat") or {}
         cid = c.get("id")
         if not cid: continue
         k = str(cid)
+        if slugs:
+            ans = tg_cmd(cid, m.get("text"), slugs, names)
+            if ans:
+                sb = subs_load()
+                if k in sb and not sb[k].get("name"):
+                    sb[k]["name"] = (" ".join(x for x in (c.get("first_name"), c.get("last_name")) if x)
+                                     or c.get("username") or "—")
+                    subs_save(sb)
+                tg_call("sendMessage", {"chat_id": cid, "text": ans})
         if k in known: continue
         known[k] = {"name": " ".join(x for x in (c.get("first_name"), c.get("last_name")) if x) or "—",
                     "username": c.get("username") or "",
@@ -1713,9 +1794,15 @@ def tg_poll(quiet=True):
             "— утром план: что на вас открыто и что зависло\n"
             "— вечером итог: что закрыли за день\n"
             "— сразу, когда на вас назначат карточку в BUG или ToDo\n\n"
-            "Пока администратор не свяжет ваш чат с учётной записью Taiga, "
-            "сообщений не будет. Это делается вручную — напишите ему, что подписались."})
+            "Тестировщикам: напишите «проекты все» или перечислите слаги "
+            "(«проекты domcom, checkpoint») — буду присылать карточки, "
+            "пришедшие на проверку. «помощь» — список команд.\n\n"
+            "Для остального администратор должен связать ваш чат с учётной "
+            "записью Taiga — напишите ему, что подписались."})
     if new: cfg_set("telegram_seen", known)
+    # Смещение двигаем ПОСЛЕДНИМ: сорвались раньше — сообщения придут снова
+    # и команды применятся повторно, что безопасно. Наоборот было бы потерей.
+    if last is not None: cfg_set("telegram_offset", last + 1)
     return new, None
 
 def cmd_telegram(args):
@@ -2055,7 +2142,7 @@ def notify_columns(args, seen):
                 key = f"col:{pslug}/{kind}/{o['ref']}/{col}"
                 if key in seen: continue
                 fresh.setdefault(col.strip().lower(), []).append({
-                    "key": key, "col": col, "pr": pname, "ref": o["ref"],
+                    "key": key, "col": col, "pr": pname, "slug": pslug, "ref": o["ref"],
                     "subj": o["subject"], "holder": un.get(o.get("assigned_to"), "не назначена"),
                     "url": f"{base()}/project/{pslug}/{web}/{o['ref']}"})
     sent = 0
@@ -2070,36 +2157,54 @@ def notify_columns(args, seen):
             ok(f"колонка «{col}»: впервые в рассылке — {len(items)} карточек "
                f"помечены как известные, сообщений не шлю")
             continue
+        # Два источника получателей: список администратора (по именам в Taiga,
+        # без разбора проектов) и самоподписка через бота (со своим набором).
         targets = []
         for nm in want[col_l]:
             t = by_name.get(nm.lower()) or next(
                 (v for k, v in by_name.items() if nm.lower() in k), None)
-            if t: targets.append(t)
+            if t: targets.append({"chat_id": t["chat_id"], "name": t["name"], "projects": []})
             else: ok(f"колонка «{col}»: «{nm}» не подключён к боту — пропускаю")
+        have = {t["chat_id"] for t in targets}
+        for cid, sb in subs_load().items():
+            if int(cid) in have: continue
+            targets.append({"chat_id": int(cid), "name": sb.get("name") or cid,
+                            "projects": sb.get("projects") or []})
         if not targets:
-            ok(f"колонка «{col}»: получателей нет, {len(items)} карточек не отправлено")
+            # Отметку ставим всё равно: иначе первый подписавшийся получит
+            # всё, что накопилось, пока получателей не было.
+            for x in items: seen[x["key"]] = True
+            notify_save(seen)
+            ok(f"колонка «{col}»: получателей нет, {len(items)} карточек помечены без отправки")
             continue
         items.sort(key=lambda x: -x["ref"])
-        if len(items) <= 3:
-            msgs = [f"\U0001F9EA В «{col}» · {x['pr']} #{x['ref']}\n{cut(x['subj'], 110)}\n"
-                    f"от: {x['holder']}\n{x['url']}" for x in items]
-        else:
-            L = [f"\U0001F9EA В «{col}» новых карточек: {len(items)}", ""]
-            for x in items[:15]:
+        def compose(part):
+            if len(part) <= 3:
+                return [f"\U0001F9EA В «{col}» · {x['pr']} #{x['ref']}\n{cut(x['subj'], 110)}\n"
+                        f"от: {x['holder']}\n{x['url']}" for x in part]
+            L = [f"\U0001F9EA В «{col}» новых карточек: {len(part)}", ""]
+            for x in part[:15]:
                 L += [f"{x['pr']} #{x['ref']} · {cut(x['subj'], 70)}", x["url"], ""]
-            if len(items) > 15: L.append(f"…и ещё {len(items)-15}")
-            msgs = ["\n".join(L).strip()]
+            if len(part) > 15: L.append(f"…и ещё {len(part)-15}")
+            return ["\n".join(L).strip()]
+        touched = False
         for t in targets:
+            mine = [x for x in items if not t["projects"] or x["slug"] in t["projects"]]
+            if not mine:
+                ok(f"  колонка «{col}» → {t['name']}: ничего по его проектам"); continue
             okall = True
-            for txt in msgs:
+            for txt in compose(mine):
                 r = tg_call("sendMessage", {"chat_id": t["chat_id"], "text": txt,
                                             "disable_web_page_preview": True})
                 if not r.get("ok"):
                     okall = False
                     ok(f"  {t['name']}: ОШИБКА {r.get('description')}")
-            if okall: ok(f"  колонка «{col}» → {t['name']}: {len(items)} шт.")
+            if okall:
+                touched = True
+                ok(f"  колонка «{col}» → {t['name']}: {len(mine)} шт."
+                   + ("" if not t["projects"] else f" (из {len(items)})"))
         for x in items: seen[x["key"]] = True
-        sent += len(items)
+        if touched: sent += len(items)
         notify_save(seen)
     return sent
 
