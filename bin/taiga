@@ -2178,8 +2178,14 @@ def recon_stubs(reg, only_slug=None, only_ref=None):
             if not m: continue
             ref = int(m.group(1))
             if only_ref and ref != only_ref: continue
-            out.append({"slug": slug, "root": folder, "file": fn, "ref": ref, "text": txt})
-    out.sort(key=lambda x: -x["ref"])              # свежие тикеты вперёд
+            m2 = re.search(r"исполнитель: (.+)$", txt, re.M)
+            who = (m2.group(1).strip() if m2 else "")
+            mine = bool(who) and who != "не назначена"
+            out.append({"slug": slug, "root": folder, "file": fn, "ref": ref,
+                        "text": txt, "who": who, "assigned": mine})
+    # Назначенные вперёд: у них есть кому читать разбор сегодня. Ничьи ждут —
+    # их всё равно сначала кому-то отдадут. Внутри каждой кучки — свежие вперёд.
+    out.sort(key=lambda x: (not x["assigned"], -x["ref"]))
     return out
 
 def recon_env():
