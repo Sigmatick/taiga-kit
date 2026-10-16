@@ -1873,7 +1873,76 @@ def cmd_digest(args):
 # же не пишем — состояние хранит тройку (проект, номер, исполнитель, статус).
 NOTIFY_STATE = HOME / ".taiga-kit" / "notify-state.json"
 
+NOTIFY_LABEL = "kz.taiga-kit.notify"
+
+def notify_install(args):
+    """Расписание адресных уведомлений. Ставится ТОЛЬКО на одной машине:
+    каждая копия шлёт всем получателям, две копии — два сообщения на человека."""
+    exe = str(pathlib.Path(sys.argv[0]).resolve())
+    h_from, h_to, every = int(args.start), int(args.end), max(1, int(args.every))
+    if sys.platform == "win32":
+        name = "TaigaKitNotify"
+        if args.uninstall:
+            r = subprocess.run(["schtasks","/Delete","/TN",name,"/F"], capture_output=True, text=True)
+            ok("расписание снято" if not r.returncode else f"schtasks: {r.stdout}{r.stderr}"); return
+        dw = "MON,TUE,WED,THU,FRI,SAT,SUN" if args.all_days else "MON,TUE,WED,THU,FRI"
+        r = subprocess.run(["schtasks","/Create","/TN",name,
+                            "/TR",f'"{sys.executable}" "{exe}" notify',
+                            "/SC","WEEKLY","/D",dw,"/ST",f"{h_from:02d}:15",
+                            "/RI",str(every*60),"/DU",f"{max(1,h_to-h_from):04d}:00","/F"],
+                           capture_output=True, text=True)
+        if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
+        ok(f"расписание поставлено: задание «{name}»"); return
+    if sys.platform != "darwin":
+        ok(f"для cron:  15 {h_from}-{h_to} * * 1-5  {exe} notify >> ~/.taiga-kit/notify.log 2>&1"); return
+    plist = HOME / "Library" / "LaunchAgents" / f"{NOTIFY_LABEL}.plist"
+    if args.uninstall:
+        subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+        if plist.exists(): plist.unlink()
+        ok(f"расписание снято: {plist}"); return
+    if not (0 <= h_from <= 23 and 0 <= h_to <= 23 and h_from <= h_to):
+        die("часы должны быть 0–23 и --start не позже --end")
+    days = range(0, 7) if args.all_days else range(1, 6)
+    hour_list = list(range(h_from, h_to + 1, every))
+    # :15 — чтобы не бить по API одновременно с дозорным, который ходит в :05
+    hours = "".join(f"    <dict><key>Weekday</key><integer>{d}</integer>"
+                    f"<key>Hour</key><integer>{h}</integer><key>Minute</key><integer>15</integer></dict>\n"
+                    for d in days for h in hour_list)
+    log = HOME / ".taiga-kit"; log.mkdir(parents=True, exist_ok=True)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{NOTIFY_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{exe}</string><string>notify</string></array>
+  <key>StartCalendarInterval</key>
+  <array>
+{hours}  </array>
+  <key>StandardOutPath</key><string>{log}/notify.log</string>
+  <key>StandardErrorPath</key><string>{log}/notify.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+""")
+    subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+    r = subprocess.run(["launchctl","load",str(plist)], capture_output=True, text=True)
+    if r.returncode: die(f"launchctl: {r.stderr.strip()}")
+    ok(f"расписание поставлено: {plist}")
+    ok(f"{'каждый час' if every == 1 else f'каждые {every} ч'} с {h_from}:15 до {h_to}:15, "
+       f"{'все дни' if args.all_days else 'по будням'}")
+    ok(f"журнал: {log}/notify.log")
+    ok("ставить только на одной машине: каждая копия шлёт всем получателям")
+    ok("снять: taiga notify --uninstall")
+
+def notify_save(seen):
+    NOTIFY_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = NOTIFY_STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(seen, ensure_ascii=False)); tmp.replace(NOTIFY_STATE)
+
 def cmd_notify(args):
+    if args.install or args.uninstall: return notify_install(args)
     auth()
     rec = cfg_load().get("telegram_recipients", {})
     if not rec: die("получателей нет — см. `taiga telegram --discover`")
@@ -1882,6 +1951,7 @@ def cmd_notify(args):
     if NOTIFY_STATE.is_file():
         try: seen = json.loads(NOTIFY_STATE.read_text())
         except json.JSONDecodeError: seen = {}
+    based = set(seen.get("__baselined__") or [])
 
     c, projects = api("GET", "/projects")
     fresh, sent, skipped = [], 0, 0
@@ -1909,22 +1979,37 @@ def cmd_notify(args):
 
     if args.baseline:
         for x in fresh: seen[x["key"]] = True
-        NOTIFY_STATE.parent.mkdir(parents=True, exist_ok=True)
-        NOTIFY_STATE.write_text(json.dumps(seen, ensure_ascii=False))
+        seen["__baselined__"] = sorted(based | set(rec))
+        notify_save(seen)
         ok(f"отсечка поставлена: {len(fresh)} уже назначенных карточек помечены как известные.")
         ok("Ничего не отправлено. Уведомления пойдут только о том, что появится дальше.")
         return
+
+    # Новичок в рассылке получил бы разом все свои открытые карточки — два
+    # десятка сообщений в первую же минуту. Отсечка ему ставится сама.
+    newbies = {u for u in rec if u not in based}
+    if newbies and not args.dry:
+        held = [x for x in fresh if x["uid"] in newbies]
+        for x in held: seen[x["key"]] = True
+        seen["__baselined__"] = sorted(based | newbies)
+        notify_save(seen)
+        for u in sorted(newbies):
+            n = len([x for x in held if x["uid"] == u])
+            ok(f"{rec[u]['name']}: впервые в рассылке — {n} уже назначенных карточек "
+               f"помечены как известные, сообщений не шлю")
+        fresh = [x for x in fresh if x["uid"] not in newbies]
     if not fresh:
         ok(f"новых назначений нет (уже отмечено: {skipped})"); return
-    if len(fresh) > int(args.max):
-        die(f"к отправке {len(fresh)} карточек — больше порога {args.max}.\n"
-            f"       Так бывает при первом запуске: сейчас в работе 120+ назначенных карточек,\n"
-            f"       и люди получили бы по два десятка сообщений разом.\n"
-            f"       Сначала `taiga notify --baseline` — пометить существующее и слать только новое.")
     byuser = {}
     for x in fresh: byuser.setdefault(x["uid"], []).append(x)
     for uid, items in byuser.items():
         who = items[0]["name"]
+        if len(items) > int(args.max):
+            # Падать нельзя: это задание по расписанию, и останов лишил бы
+            # уведомлений всех остальных. Пропускаем одного, отметку не ставим.
+            ok(f"{who}: к отправке {len(items)} — больше порога {args.max}, пропускаю. "
+               f"Посмотреть: taiga notify --dry")
+            continue
         head = "Вам назначена карточка:" if len(items) == 1 else f"Вам назначено карточек: {len(items)}"
         lines = [head, ""]
         for x in items[:10]:
@@ -1944,8 +2029,7 @@ def cmd_notify(args):
         else:
             ok(f"{who}: ОШИБКА {r.get('description')} — отметку не ставлю, повторим позже")
     if not args.dry:
-        NOTIFY_STATE.parent.mkdir(parents=True, exist_ok=True)
-        NOTIFY_STATE.write_text(json.dumps(seen, ensure_ascii=False))
+        notify_save(seen)
         ok(f"\nразослано карточек: {sent}")
     else:
         ok("(сухой прогон — ничего не отправлено, отметки не поставлены)")
@@ -2158,7 +2242,13 @@ def main():
     nt = P("notify"); nt.add_argument("--dry", action="store_true", help="показать, не отправляя")
     nt.add_argument("--baseline", action="store_true",
                     help="пометить всё нынешнее как известное, ничего не отправляя")
-    nt.add_argument("--max", default="15", help="предохранитель: больше за раз не слать")
+    nt.add_argument("--max", default="15", help="предохранитель: больше за раз одному не слать")
+    nt.add_argument("--install", action="store_true", help="расписание: ежечасно 9–19 по будням")
+    nt.add_argument("--uninstall", action="store_true")
+    nt.add_argument("--every", default="1", metavar="Ч", help="период опроса в часах")
+    nt.add_argument("--start", default="9", metavar="Ч", help="с какого часа")
+    nt.add_argument("--end", default="19", metavar="Ч", help="по какой час")
+    nt.add_argument("--all-days", action="store_true", help="включая выходные")
     nt.set_defaults(fn=cmd_notify)
     tg = P("telegram")
     tg.add_argument("--discover", action="store_true", help="кто писал боту: имена и chat_id")
