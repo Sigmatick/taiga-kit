@@ -4,7 +4,7 @@ Taiga в Claude Code
 ЧТО ЗАПУСТИТЬ
 
   macOS    двойной щелчок по  setup-macos.command
-  Windows  правая кнопка по   setup-windows.ps1  ->  «Выполнить с помощью PowerShell»
+  Windows  двойной щелчок по  setup-windows.cmd
   Linux    в терминале:       bash setup-linux.sh
 
 Установщик сначала спросит, кто вы:
@@ -30,7 +30,11 @@ Taiga в Claude Code
 
 ЕСЛИ WINDOWS НЕ ДАЁТ ЗАПУСТИТЬ
 
-  Откройте PowerShell в этой папке и выполните две строки:
+  Запускайте setup-windows.cmd, а не .ps1 — он сам обходит политику
+  выполнения и не закрывает окно.
+
+  Если окно всё же закрылось мгновенно, откройте PowerShell в этой
+  папке и выполните две строки — ошибка останется на экране:
 
      Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
      .\setup-windows.ps1
@@ -57,9 +61,9 @@ Taiga в Claude Code
 
 ЧТО ЧИТАТЬ
 
-  Taiga-в-Claude-Code-для-менеджеров.docx   инструкция для тех, кто ведёт задачи
-  ДЛЯ-МЕНЕДЖЕРОВ.md                         она же в текстовом виде
-  ДЛЯ-РАЗРАБОТЧИКОВ.md                      дозорный, реестр, разбор тикетов по коду
+  Taiga-for-managers.docx   инструкция для тех, кто ведёт задачи
+  FOR-MANAGERS.md                         она же в текстовом виде
+  FOR-DEVELOPERS.md                      дозорный, реестр, разбор тикетов по коду
   README.md                                 полное описание
 
 

@@ -7,8 +7,23 @@
 
 # Работает и в Windows PowerShell 5.1 (из коробки), и в PowerShell 7.
 $ErrorActionPreference = 'Stop'
-chcp 65001 > $null                      # вывод по-русски в UTF-8
-$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
+
+# Без этого окно закрывается мгновенно при любой ошибке, и человек
+# не успевает прочитать, что случилось. Ловушка ставится ПЕРВОЙ.
+trap {
+    Write-Host ""
+    Write-Host "ОШИБКА: $_" -ForegroundColor Red
+    Write-Host "Строка: $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor DarkGray
+    Read-Host "`nEnter — закрыть"
+    exit 1
+}
+
+# Смена кодировки консоли на части систем бросает исключение. Ради
+# вывода по-русски окно ронять нельзя: не вышло — работаем как есть.
+try {
+    chcp 65001 > $null
+    $OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
+} catch { }
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 
