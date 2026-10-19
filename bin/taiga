@@ -1480,7 +1480,8 @@ def cmd_standup(args):
             for e in r["extra"]:
                 L.append(f"- ➕ сверх плана: {e['project']} #{e['ref']} · {e['subject'][:48]} → {e['to']}")
             L.append("")
-    L += [""] + test_block(events, test_queue(projects))
+    tqueue = test_queue(projects)          # обход дорогой, делаем один раз
+    L += [""] + test_block(events, tqueue)
     rd = reports_dir(); rd.mkdir(parents=True, exist_ok=True)
     out = rd / f"План-факт_{day:%Y-%m-%d}.md"
     out.write_text("\n".join(L) + "\n")
@@ -1493,7 +1494,7 @@ def cmd_standup(args):
            + ("  ⚠ " + "; ".join(b["probs"]) if b["probs"] else ""))
     if not blocks: ok("  карточек на этот день нет")
     if args.send:
-        q = test_queue(projects)
+        q = tqueue
         slug2name = {p["slug"]: p["name"] for p in (projects or [])}
         subs = subs_load()
         rec = cfg_load().get("telegram_recipients", {})
@@ -1503,10 +1504,13 @@ def cmd_standup(args):
             if not tgt: ok(f"  {b['pm']}: нет связанного чата — не отправлено"); continue
             # Человек мог отметить себе проекты в боте — тогда тестирование
             # показываем только по ним. Не отмечал — показываем всё.
-            sb = subs.get(str(tgt["chat_id"])) or {}
+            # Нет записи в боте — человек ничего не настраивал, шлём всё.
+            # Есть запись, но проектов нет — он сам снял все галочки, и бот
+            # ему об этом написал; показывать вопреки этому нельзя.
+            sb = subs.get(str(tgt["chat_id"]))
             only = None
-            if sb.get("evening") and (sb.get("projects") or []):
-                only = {slug2name.get(x, x) for x in sb["projects"]}
+            if sb is not None and sb.get("evening"):
+                only = {slug2name.get(x, x) for x in (sb.get("projects") or [])}
             r = tg_call("sendMessage", {"chat_id": tgt["chat_id"],
                                         "text": standup_tg(b, day) + "\n"
                                                 + "\n".join(test_tg(events, q, only)),
@@ -1978,6 +1982,15 @@ def tg_tap(q, slugs, names):
     tg_call("editMessageText", {"chat_id": cid, "message_id": mid, "text": head,
                                 "reply_markup": kb})
 
+TG_BEAT = HOME / ".taiga-kit" / "tgserve.beat"
+
+def tg_busy():
+    """Слушатель жив? Telegram разрешает только один getUpdates на бота:
+    второй получает 409 Conflict. Поэтому разовый опрос из дозорного
+    должен уступать постоянному слушателю, а не драться с ним."""
+    try: return time.time() - TG_BEAT.stat().st_mtime < 180
+    except Exception: return False
+
 def tg_serve(args):
     """Длинный опрос. Нажатие кнопки Telegram живёт считанные секунды:
     разобранное через две минуты уже просрочено, и у человека вечно висит
@@ -1989,6 +2002,8 @@ def tg_serve(args):
         try:
             if time.time() - fresh > 1800:            # токен живёт не вечно
                 auth(); fresh = time.time()
+            TG_BEAT.parent.mkdir(parents=True, exist_ok=True)
+            TG_BEAT.touch()
             n, err = tg_poll(long=True)
             if err:
                 print(f"telegram: {err}", file=sys.stderr); time.sleep(5)
@@ -2864,8 +2879,11 @@ def cmd_recon(args):
             continue
         bad, words = recon_check(out, s["root"])
         s["file"].write_text(recon_apply(s, out, bad, words))
-        stt["done"] = int(stt.get("done", 0)) + 1
-        recon_save(stt)
+        # Разбор по прямой просьбе человека дневной предел не ест: предел
+        # сдерживает автоматику, а не людей. Ключ --ref это и обещает.
+        if not args.ref:
+            stt["done"] = int(stt.get("done", 0)) + 1
+            recon_save(stt)
         flags = (f" · ⚠ выдуманных ссылок: {len(bad)}" if bad else "") + \
                 (f" · ⚠ запрещённые слова: {len(words)}" if words else "")
         ok(f"  {s['slug']} #{s['ref']}: готово за {secs} с{flags}")
@@ -3202,8 +3220,11 @@ def cmd_watch(args):
         # иначе человек напишет боту ночью, а к утру факт исчезнет.
         if pathlib.Path(os.path.expanduser(cfg_load().get("telegram_token_file",
                                                           str(TG_TOKEN_FILE)))).is_file():
-            n, _ = tg_poll()
-            if n: ok(f"новых подписок на бота: {n} (см. `taiga telegram --discover`)")
+            if tg_busy():
+                pass                      # слушатель уже читает за нас
+            else:
+                n, _ = tg_poll()
+                if n: ok(f"новых подписок на бота: {n} (см. `taiga telegram --discover`)")
     if lines and not made_total:
         ok("\n".join(lines))                      # предупреждения не глотаем
     if made_total:
