@@ -197,6 +197,35 @@ def do_refresh(quiet=False):
     if not quiet: ok("токен обновлён")
     return True
 
+def token_left(which="refresh"):
+    """Сколько часов осталось токену. Оба срока сдвигаются при каждом
+    обновлении, так что при ежечасных заданиях вход не протухает сам.
+    Опасны простои: выключенный на неделю компьютер, отпуск, смена пароля."""
+    import base64, datetime
+    f = (C.ref_f if which == "refresh" else C.tok_f)
+    f = f if f.is_file() else (DEF_REF if which == "refresh" else DEF_TOK)
+    try:
+        b = f.read_text().strip().split(".")[1]; b += "=" * (-len(b) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(b))["exp"]
+        return (datetime.datetime.fromtimestamp(exp) - datetime.datetime.now()).total_seconds() / 3600
+    except Exception:
+        return None
+
+def auth_warn(send=False):
+    """Предупредить, пока вход ещё жив. Молчаливый отвал — худшее, что
+    может случиться с автоматикой: отчёты просто перестают приходить."""
+    h = token_left("refresh")
+    if h is None or h > 72: return None
+    msg = (f"Вход в Taiga истекает через {int(h)} ч. "
+           f"Выполните `taiga login`, иначе отчёты, разведка и уведомления встанут."
+           if h > 0 else "Вход в Taiga истёк. Выполните `taiga login`.")
+    notify("Taiga: вход скоро истечёт", msg)
+    if send:
+        rec = cfg_load().get("telegram_recipients", {})
+        me = rec.get(str((IDENTITY or {}).get("id")))
+        if me: tg_call("sendMessage", {"chat_id": me["chat_id"], "text": "⚠ " + msg})
+    return msg
+
 IDENTITY = None
 def auth():
     """Канарейка первым вызовом: Taiga на анонимный запрос отвечает 200 и []."""
@@ -287,6 +316,12 @@ def cmd_status(args):
     ok(f"конфиг:   {C.path or '— не найден в этой папке и выше'}")
     ok(f"проект:   {C.slug or '— не задан'}")
     ok(f"токен:    {C.tok_f if C.tok_f.is_file() else DEF_TOK}")
+    h = token_left("refresh")
+    if h is not None:
+        d, hh = int(h // 24), int(h % 24)
+        mark = "" if h > 72 else "  ← пора выполнить `taiga login`"
+        ok(f"вход:     действует ещё {d} дн {hh} ч{mark}")
+        ok("          срок сдвигается при каждом обращении; опасен только простой")
 
 def cmd_projects(args):
     c, ps = api("GET", "/projects")
@@ -1762,6 +1797,8 @@ def cmd_report(args):
         L.append(f"| {loc(x['at']):%d.%m %H:%M} | {x['who']} | {x['project']} | {KINDS[x['kind']][3]} "
                  f"| {x['ref']} | {x['subject'][:48]} |")
 
+    w = auth_warn(send=True)
+    if w: L.insert(3, f"> ⚠ {w}\n")
     rd = reports_dir()
     rd.mkdir(parents=True, exist_ok=True)
     out = rd / f"Отчёт_Taiga_{start_l:%Y-%m-%d}.md"
