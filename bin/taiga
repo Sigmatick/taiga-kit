@@ -3005,12 +3005,13 @@ def cmd_recon(args):
            f"предел {timeout} с, папка проекта")
         return
 
-    done = []
+    done = []; errs = []
     for s in take:
         t0 = time.time()
         out, err = recon_run(s, timeout, cmd, model)
         secs = int(time.time() - t0)
         if err:
+            errs.append(err)
             ok(f"  {s['slug']} #{s['ref']}: не вышло — {err}")
             # Отметку дня не тратим на неудачу: иначе одна сломанная настройка
             # съест весь дневной предел и разведка встанет до завтра.
@@ -3026,6 +3027,30 @@ def cmd_recon(args):
                 (f" · ⚠ запрещённые слова: {len(words)}" if words else "")
         ok(f"  {s['slug']} #{s['ref']}: готово за {secs} с{flags}")
         done.append((s, out, bad, words))
+
+    # Беззвучное падение опаснее самого падения: разведка так простояла
+    # четыре дня, а снаружи это выглядело как «просто нет новых разборов».
+    # Поэтому о двух подряд неудачных прогонах сообщаем, но не чаще раза в день.
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+    if errs and not done:
+        stt["fails"] = int(stt.get("fails", 0)) + 1
+        stt["last_error"] = errs[0][:200]
+        if stt["fails"] >= 2 and stt.get("alerted") != today:
+            stt["alerted"] = today
+            msg = (f"Разведка не работает: {errs[0][:160]}\n"
+                   f"Неудачных прогонов подряд: {stt['fails']}. "
+                   f"Ждут разбора: {len(stubs)}.")
+            notify("Taiga: разведка встала", msg)
+            rec = cfg_load().get("telegram_recipients", {})
+            me = rec.get(str((IDENTITY or {}).get("id")))
+            if me: tg_call("sendMessage", {"chat_id": me["chat_id"], "text": "⚠ " + msg})
+            ok("  о поломке сообщено: уведомление и Telegram")
+        recon_save(stt)
+    elif done:
+        if stt.get("fails"):
+            ok(f"  разведка снова работает (до этого неудачных прогонов: {stt['fails']})")
+        stt["fails"] = 0; stt.pop("last_error", None); recon_save(stt)
 
     if args.send and done:
         recon_send(done)
