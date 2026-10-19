@@ -1515,7 +1515,12 @@ def cmd_standup(args):
                 inplan.add((s, k, r))
                 ev = moved.get((s, k, r), [])
                 it["moved"] = ev
-                it["done"] = any(x["to_closed"] and not x["from_closed"] for x in ev) or it["closed"]
+                # «Закрыто сегодня» и «уже было закрыто» — разные вещи.
+                # Раньше они сливались, и карточка, закрытая до планёрки,
+                # показывалась как выполненная за день. Это не достижение,
+                # а ошибка планирования, и прятать её нельзя.
+                it["done"] = any(x["to_closed"] and not x["from_closed"] for x in ev)
+                it["was"] = it["closed"] and not it["done"]
                 items.append(it)
             extra = []
             if who:
@@ -1541,15 +1546,16 @@ def cmd_standup(args):
         for pb in b["probs"]: L.append(f"> {pb}")
         if b["probs"]: L.append("")
         if not b["rows"]: continue
-        L += ["| Участник | В плане | Закрыто | Сдвинулось | Не тронуто | Сверх плана |",
-              "|---|---:|---:|---:|---:|---:|"]
+        L += ["| Участник | В плане | Закрыто сегодня | Было закрыто | Сдвинулось | Не тронуто | Сверх плана |",
+              "|---|---:|---:|---:|---:|---:|---:|"]
         for r in b["rows"]:
             good = [i for i in r["items"] if not i.get("bad")]
             dn = len([i for i in good if i["done"]])
-            mv = len([i for i in good if i["moved"] and not i["done"]])
+            wz = len([i for i in good if i.get("was")])
+            mv = len([i for i in good if i["moved"] and not i["done"] and not i.get("was")])
             note = " _прозой_" if r["prose"] else (" _пусто_" if r["empty"] else "")
-            L.append(f"| {r['name']}{note} | {len(good)} | {dn} | {mv} | "
-                     f"{len(good)-dn-mv} | {len(r['extra'])} |")
+            L.append(f"| {r['name']}{note} | {len(good)} | {dn} | {wz} | {mv} | "
+                     f"{len(good)-dn-wz-mv} | {len(r['extra'])} |")
         L.append("")
         for r in b["rows"]:
             L.append(f"**{r['name']}**" + ("" if r["who"] else "  ← в Taiga такого человека не нашёл"))
@@ -1557,10 +1563,11 @@ def cmd_standup(args):
             elif r["prose"]: L.append(f"- план прозой, без ссылок — сверить не с чем: {r_body(r)}")
             for i in r["items"]:
                 if i.get("bad"): L.append(f"- ❓ {i['bad']}"); continue
-                mark = "✅" if i["done"] else ("▶" if i["moved"] else "⏸")
-                tail = (" · ".join(f"{x['from']} → {x['to']}" for x in i["moved"][-2:])
-                        if i["moved"] else i["status"])
-                L.append(f"- {mark} {i['project']} #{i['ref']} · {i['subject'][:48]} · {tail}")
+                mark = ("✅" if i["done"] else "\u2611" if i.get("was")
+                        else "▶" if i["moved"] else "⏸")
+                tail = move_chain(i["moved"], i["status"])
+                L.append(f"- {mark} {i['project']} #{i['ref']} · {i['subject'][:48]} · {tail}"
+                         + ("  ← была закрыта ещё до плана" if i.get("was") else ""))
             if r["bare"]:
                 L.append(f"- ❓ номера без ссылок, проект не определить: "
                          + ", ".join(f"#{x}" for x in r["bare"][:8]))
@@ -1605,6 +1612,22 @@ def cmd_standup(args):
             ok(f"  {b['pm']}: {'отправлено' if r.get('ok') else 'ОШИБКА ' + str(r.get('description'))}")
     return out
 
+def move_chain(ev, fallback=""):
+    """Путь карточки за день одной строкой: Backlog → ToDo → Done.
+
+    API отдаёт журнал НОВЫМИ ВПЕРЁД. Раньше бралось ev[-2:] — то есть два
+    самых старых шага, а решающий последний прятался: карточка значилась
+    закрытой, а в следе стояло «ToDo → In progress». Сортируем по времени
+    и склеиваем в цепочку."""
+    if not ev: return fallback
+    seq = sorted(ev, key=lambda x: x["at"])
+    out = [seq[0]["from"]]
+    for x in seq:
+        if out[-1] != x["from"]: out.append(x["from"])
+        out.append(x["to"])
+    if len(out) > 4: out = [out[0], "…"] + out[-2:]
+    return " → ".join(out)
+
 def standup_tg(b, day):
     L = [f"План против факта · {day:%d.%m}", ""]
     for pb in b["probs"]: L.append(f"⚠ {pb}")
@@ -1612,11 +1635,13 @@ def standup_tg(b, day):
     for r in b["rows"]:
         good = [i for i in r["items"] if not i.get("bad")]
         dn = len([i for i in good if i["done"]])
+        wz = len([i for i in good if i.get("was")])
         tag = " · план пуст" if r["empty"] else (" · план прозой, без ссылок" if r["prose"] else "")
-        L.append(f"{r['name']}: {dn} из {len(good)}{tag}")
+        L.append(f"{r['name']}: {dn} из {len(good)}{tag}"
+                 + (f" · {wz} были закрыты до плана" if wz else ""))
         for i in good:
             if i["done"]: continue
-            mark = "▶" if i["moved"] else "⏸"
+            mark = "\u2611" if i.get("was") else ("▶" if i["moved"] else "⏸")
             L.append(f"  {mark} {i['project']} #{i['ref']} · {i['subject'][:40]} · {i['status']}")
         for e in r["extra"][:4]:
             L.append(f"  ➕ {e['project']} #{e['ref']} · {e['subject'][:40]}")
