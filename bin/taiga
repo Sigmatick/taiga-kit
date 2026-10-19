@@ -2294,7 +2294,13 @@ def digest_data(uid, need_closed=False):
     today = datetime.datetime.now(TZl).replace(hour=0, minute=0, second=0, microsecond=0)
     prev = today - datetime.timedelta(days=1)
     while prev.weekday() >= 5: prev -= datetime.timedelta(days=1)
+    # Два разных окна, и путать их нельзя. «Новое без исполнителя» —
+    # за предыдущий рабочий день: утром человеку показывают, что появилось,
+    # пока его не было. «Закрыли сегодня» — именно сегодня, с полуночи.
+    # Раньше вечерний итог брал окно предыдущего дня и подписывал его
+    # «сегодня»: в понедельник приходили пятничные закрытия.
     w_from, w_to = prev.astimezone(datetime.timezone.utc), today.astimezone(datetime.timezone.utc)
+    d_from, d_to = today.astimezone(datetime.timezone.utc), now
     _d = lambda s: datetime.datetime.fromisoformat(s.replace("Z","+00:00")) if s else None
 
     mine, stuck, closed_y, fresh = [], [], [], []
@@ -2306,6 +2312,7 @@ def digest_data(uid, need_closed=False):
                                         ("issue","issues","issue-statuses","issue")):
             c, st = api("GET", f"/{ep}?project={pid}")
             cat = {s["id"]: (s["name"], s.get("is_closed", False)) for s in (st or [])}
+            closed_by_name = {x["name"].strip().lower(): x.get("is_closed", False) for x in (st or [])}
             c, objs = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
             for o in (objs or []):
                 nm, closed = cat.get(o["status"], ("?", False))
@@ -2318,28 +2325,34 @@ def digest_data(uid, need_closed=False):
                 if cd and w_from <= cd < w_to and not o.get("assigned_to"): fresh.append(rec)
                 # журнал читаем только для вечернего итога и только по тронутым
                 # в окне: иначе это сотни запросов и минуты ожидания
-                if need_closed and closed and o.get("modified_date") and _d(o["modified_date"]) >= w_from:
+                if need_closed and o.get("modified_date") and _d(o["modified_date"]) >= d_from:
                     c2, h = api("GET", f"/history/{api_name}/{o['id']}")
                     for e in (h or []):
                         vd = e.get("values_diff") or {}
                         if "status" not in vd: continue
                         tm = _d(e["created_at"])
-                        if not (w_from <= tm < w_to): continue
-                        if (e.get("user") or {}).get("pk") == uid and cat.get(o["status"], ("",False))[1]:
+                        if not (d_from <= tm < d_to): continue
+                        if (e.get("user") or {}).get("pk") != uid: continue
+                        # Засчитываем переход ИМЕННО В закрывающий статус.
+                        # Раньше годился любой: достаточно было тронуть карточку,
+                        # которую закрыл кто-то другой.
+                        was, now_st = vd["status"][0], vd["status"][1]
+                        if closed_by_name.get(str(now_st).strip().lower()) and \
+                           not closed_by_name.get(str(was).strip().lower()):
                             closed_y.append(rec); break
     return {"mine": mine, "stuck": stuck, "closed": closed_y, "fresh": fresh,
-            "period": f"{prev:%d.%m}"}
+            "period": f"{prev:%d.%m}", "day": f"{today:%d.%m}"}
 
 def digest_text(name, d, kind):
     import datetime
     L = [f"Taiga · {name} · {datetime.datetime.now().astimezone():%a %d.%m}", ""]
     if kind == "evening":
         if d["closed"]:
-            L.append(f"Закрыли сегодня: {len(d['closed'])}")
+            L.append(f"Закрыли {d.get('day','сегодня')}: {len(d['closed'])}")
             for r in d["closed"][:6]:
                 L.append(f"  \u2705 {r['pr']} #{r['ref']} · {cut(r['subj'], 70)}")
         else:
-            L.append("Сегодня ничего не закрыто.")
+            L.append(f"За {d.get('day','сегодня')} ничего не закрыто.")
         inwork = [r for r in d["mine"] if "progress" in r["st"].lower()]
         if inwork:
             L.append("")
