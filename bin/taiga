@@ -1348,8 +1348,12 @@ def test_block(events, queue):
                      f"| {cut(x['subject'], 46)} | {x['who']} |")
     return L
 
-def test_tg(events, queue):
-    """Та же сводка в двух словах, для сообщения руководителю."""
+def test_tg(events, queue, only=None):
+    """Та же сводка в двух словах, для сообщения руководителю.
+    `only` — названия проектов, которые человек отметил себе в боте."""
+    if only:
+        events = [x for x in events if x["project"] in only]
+        queue = {k: v for k, v in queue.items() if k in only}
     into, passed, back, other = test_flow(events)
     tot = sum(queue.values())
     L = ["", f"\U0001F9EA Тестирование: ушло {len(into)}, проверено {len(passed)}, "
@@ -1489,14 +1493,23 @@ def cmd_standup(args):
            + ("  ⚠ " + "; ".join(b["probs"]) if b["probs"] else ""))
     if not blocks: ok("  карточек на этот день нет")
     if args.send:
-        tq = test_tg(events, test_queue(projects))
+        q = test_queue(projects)
+        slug2name = {p["slug"]: p["name"] for p in (projects or [])}
+        subs = subs_load()
         rec = cfg_load().get("telegram_recipients", {})
         for b in blocks:
             tgt = next((v for v in rec.values() if b["pm"].lower() in (v.get("name") or "").lower()
                         or (v.get("name") or "").lower() in b["pm"].lower()), None)
             if not tgt: ok(f"  {b['pm']}: нет связанного чата — не отправлено"); continue
+            # Человек мог отметить себе проекты в боте — тогда тестирование
+            # показываем только по ним. Не отмечал — показываем всё.
+            sb = subs.get(str(tgt["chat_id"])) or {}
+            only = None
+            if sb.get("evening") and (sb.get("projects") or []):
+                only = {slug2name.get(x, x) for x in sb["projects"]}
             r = tg_call("sendMessage", {"chat_id": tgt["chat_id"],
-                                        "text": standup_tg(b, day) + "\n" + "\n".join(tq),
+                                        "text": standup_tg(b, day) + "\n"
+                                                + "\n".join(test_tg(events, q, only)),
                                         "disable_web_page_preview": True})
             ok(f"  {b['pm']}: {'отправлено' if r.get('ok') else 'ОШИБКА ' + str(r.get('description'))}")
     return out
@@ -1746,13 +1759,13 @@ def tg_token():
         die(f"нет токена бота ({p}). Создайте бота у @BotFather и положите токен туда")
     return p.read_text().strip()
 
-def tg_call(method, payload=None):
+def tg_call(method, payload=None, timeout=30):
     url = f"https://api.telegram.org/bot{tg_token()}/{method}"
     data = json.dumps(payload).encode() if payload else None
     r = urllib.request.Request(url, data=data, method="POST" if data else "GET")
     if data: r.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(r, timeout=30) as x: return json.loads(x.read().decode())
+        with urllib.request.urlopen(r, timeout=timeout) as x: return json.loads(x.read().decode())
     except urllib.error.HTTPError as e:
         try: return json.loads(e.read().decode())
         except Exception: return {"ok": False, "description": f"HTTP {e.code}"}
@@ -1769,6 +1782,7 @@ TG_HELP = (
     "проекты domcom, checkpoint — следить за этими проектами\n"
     "проекты все — за всеми\n"
     "проекты — показать, за чем слежу сейчас\n"
+    "сразу / вечером — переключить режим\n"
     "стоп — отписаться\n"
     "проекты? — выбрать кнопками\n\n"
     "Менять можно в любой момент, просто напишите заново."
@@ -1790,8 +1804,21 @@ def tg_cmd(cid, text, slugs, names):
 
     if low in ("помощь", "help", "start", "старт", "?"): return TG_HELP
 
-    if low in ("проекты?", "проекты ?", "список", "projects?", "выбрать"):
+    if low in ("проекты?", "проекты ?", "список", "projects?", "выбрать", "режим"):
         return "__BOARD__"
+    if low in ("сразу", "вечером"):
+        f = "instant" if low == "сразу" else "evening"
+        me = subs.get(str(cid)) or {"projects": [], "instant": False, "evening": False}
+        me[f] = not bool(me.get(f, f == "instant"))
+        me.setdefault("instant", False); me.setdefault("evening", False)
+        if not me["instant"] and not me["evening"]:
+            subs.pop(str(cid), None); subs_save(subs)
+            return "Отписал: ни один режим не выбран."
+        subs[str(cid)] = me; subs_save(subs)
+        return ("Присылаю: "
+                + ("сразу" if me["instant"] else "")
+                + (" и вечером" if me["instant"] and me["evening"] else
+                   "вечером" if me["evening"] else "") + ".")
 
     if not (low == "проекты" or low.startswith(("проекты ", "projects"))):
         return None                                   # не команда — молчим
@@ -1804,9 +1831,10 @@ def tg_cmd(cid, text, slugs, names):
                 "Слежу за: " + ", ".join(names.get(x, x) for x in p)) + "\nСменить: напишите заново."
 
     if arg.lower() in ("все", "всё", "all", "*"):
-        me["projects"] = []
+        me["projects"] = sorted(slugs); me["all"] = True
     else:
         want = [x.strip().lower() for x in re.split(r"[,\s]+", arg) if x.strip()]
+        me["all"] = False
         good = [x for x in want if x in slugs]
         bad = [x for x in want if x not in slugs]
         if not good:
@@ -1822,26 +1850,61 @@ def tg_cmd(cid, text, slugs, names):
     if me.pop("_bad", None): ans += "\nНе понял и пропустил: " + ", ".join(bad)
     return ans
 
+def subs_sync(slugs, quiet=True):
+    """Подтянуть список проектов у тех, кто выбрал «все». Проект завели
+    вчера — сегодня он у них уже в подписке, руками трогать не надо.
+    У остальных вычищаем исчезнувшие слаги, чтобы не копился мусор."""
+    subs = subs_load(); changed = []
+    for cid, sb in list(subs.items()):
+        was = list(sb.get("projects") or [])
+        now = sorted(slugs) if sb.get("all") else sorted(set(was) & set(slugs))
+        if now != was:
+            sb["projects"] = now; changed.append((sb.get("name") or cid, len(now) - len(was)))
+    if changed:
+        subs_save(subs)
+        if not quiet:
+            for who, d in changed: ok(f"  {who}: проектов {'+' if d > 0 else ''}{d}")
+    return len(changed)
+
 def tg_board(cid, slugs, names):
     """Текст и клавиатура выбора проектов. Нет записи в подписках — значит
     человек не подписан, и галочек нет."""
     sub = subs_load().get(str(cid))
-    if sub is None: chosen = set()
-    elif not (sub.get("projects") or []): chosen = set(slugs)      # пусто = все
-    else: chosen = set(sub["projects"])
-    rows, row = [], []
+    # Список проектов всегда явный. «Все» — не особое состояние, а просто
+    # все галочки разом: кнопка должна делать видимое, иначе непонятно,
+    # сработала она или нет.
+    chosen = set() if sub is None else set(sub.get("projects") or [])
+    allp = bool(chosen) and chosen >= set(slugs)
+    # Показываем ровно то, что лежит в памяти. Раньше у неподписанного
+    # кнопка рисовалась включённой, а хранилось «выключено»: нажатие её
+    # включало, вид не менялся — выглядело как поломка.
+    inst = bool((sub or {}).get("instant", False))
+    eve = bool((sub or {}).get("evening", False))
+    rows = [[{"text": "\u2705 \U0001F9EA сразу: ДА" if inst else "\u2B1C \U0001F9EA сразу: нет",
+              "callback_data": "p:*inst"},
+             {"text": "\u2705 \U0001F319 вечером: ДА" if eve else "\u2B1C \U0001F319 вечером: нет",
+              "callback_data": "p:*eve"}]]
+    row = []
     for sl in sorted(slugs):
-        row.append({"text": ("☑ " if sl in chosen else "▫ ") + names[sl][:20],
+        row.append({"text": ("✅ " if sl in chosen else "⬜ ") + names[sl][:18],
                     "callback_data": f"p:{sl}"})
         if len(row) == 2: rows.append(row); row = []
     if row: rows.append(row)
-    rows.append([{"text": "Все", "callback_data": "p:*all"},
-                 {"text": "Снять все", "callback_data": "p:*none"},
+    rows.append([{"text": ("✅ Все проекты" if allp else "⬜ Все проекты"),
+                  "callback_data": "p:*all"},
+                 {"text": "🔄 Обновить список", "callback_data": "p:*sync"}])
+    rows.append([{"text": "Отписаться", "callback_data": "p:*none"},
                  {"text": "Готово", "callback_data": "p:*done"}])
     if sub is None: head = "Отметьте проекты, за которыми следить."
-    elif not (sub.get("projects") or []): head = "Слежу за всеми проектами."
+    elif allp: head = "Слежу за всеми проектами."
+    elif not chosen: head = "⚠ Проекты не отмечены — присылать нечего. Отметьте нужные."
     else: head = "Слежу за: " + ", ".join(names.get(x, x) for x in sorted(chosen))
-    return head + "\n\nКарточки присылаю, когда они приходят на проверку.", {"inline_keyboard": rows}
+    mode = ("сразу, как карточка пришла на проверку" if inst and not eve else
+            "вечером, одной сводкой" if eve and not inst else
+            "сразу и вечером" if inst and eve else "ничего не присылаю")
+    return (head + f"\n\nПрисылаю: {mode}.\n"
+            "🧪 сразу — для тестировщиков. 🌙 вечером — для руководителей.",
+            {"inline_keyboard": rows})
 
 def tg_tap(q, slugs, names):
     """Нажатие кнопки. Снял последнюю галочку — отписали: подписка
@@ -1854,8 +1917,7 @@ def tg_tap(q, slugs, names):
     arg = data[2:]
     subs = subs_load(); key = str(cid)
     sub = subs.get(key)
-    cur = set(slugs) if (sub is not None and not (sub.get("projects") or [])) \
-          else set((sub or {}).get("projects") or [])
+    cur = set((sub or {}).get("projects") or [])
     note = ""
     if arg == "*done":
         tg_call("answerCallbackQuery", {"callback_query_id": q["id"], "text": "Сохранено"})
@@ -1863,29 +1925,79 @@ def tg_tap(q, slugs, names):
         tg_call("editMessageText", {"chat_id": cid, "message_id": mid,
                                     "text": head.split("\n\n")[0] + "\n\nМенять — «проекты?»."})
         return
-    if arg == "*all":
-        subs[key] = {**(sub or {}), "projects": []}; note = "Все проекты"
+    if arg in ("*inst", "*eve"):
+        # Режим — это «когда присылать», а не «что выбрать». Проекты
+        # остаются как были: кнопка делает ровно то, что на ней написано.
+        if sub is None:
+            ok_ = {"projects": [], "instant": False, "evening": False}
+        else: ok_ = dict(sub)
+        f = "instant" if arg == "*inst" else "evening"
+        ok_[f] = not bool(ok_.get(f, False))
+        if not ok_.get("instant") and not ok_.get("evening"):
+            subs.pop(key, None); note = "Отписал: ни один режим не выбран"
+        else:
+            subs[key] = ok_
+            note = ("Буду присылать сразу" if arg == "*inst" and ok_["instant"] else
+                    "Не буду присылать сразу" if arg == "*inst" else
+                    "Буду присылать вечером" if ok_["evening"] else "Не буду присылать вечером")
+    elif arg == "*sync":
+        # Список проектов мог измениться: новый завели, старый переименовали.
+        if sub is None: note = "Список обновлён"
+        else:
+            if sub.get("all"): subs[key] = {**sub, "projects": sorted(slugs)}
+            else: subs[key] = {**sub, "projects": sorted(set(sub.get("projects") or []) & set(slugs))}
+            note = "Список обновлён"
+    elif arg == "*all":
+        full = sorted(slugs)
+        on = not (set((sub or {}).get("projects") or []) >= set(slugs))
+        # Флаг «все» — это намерение следить за всем, включая проекты,
+        # которых ещё нет. По нему список и обновляется каждый день.
+        subs[key] = {**(sub or {}), "projects": full if on else [], "all": on}
+        note = "Отметил все" if on else "Снял все"
     elif arg == "*none":
         subs.pop(key, None); note = "Отписал"
     elif arg in slugs:
         cur.symmetric_difference_update({arg})
-        if not cur: subs.pop(key, None); note = "Отписал"
-        else:
-            subs[key] = {**(sub or {}), "projects": sorted(cur)}
-            note = ("Добавил " if arg in cur else "Убрал ") + names.get(arg, arg)
+        # Ткнул конкретный — это уже не «следить за всем».
+        subs[key] = {**(sub or {}), "projects": sorted(cur), "all": False}
+        note = ("Добавил " if arg in cur else "Убрал ") + names.get(arg, arg)
+        if not cur: note += " · проектов не осталось, присылать нечего"
     else:
-        return
-    if key in subs and not subs[key].get("name"):
-        c = msg.get("chat") or {}
-        subs[key]["name"] = (" ".join(x for x in (c.get("first_name"), c.get("last_name")) if x)
-                             or c.get("username") or str(cid))
-    subs_save(subs)
+        return                                      # кнопка не наша — молчим
+    if key in subs:
+        subs[key].setdefault("instant", True)       # по умолчанию — как тестировщику
+        subs[key].setdefault("evening", False)
+        if not subs[key].get("name"):
+            c = msg.get("chat") or {}
+            subs[key]["name"] = (" ".join(x for x in (c.get("first_name"), c.get("last_name")) if x)
+                                 or c.get("username") or str(cid))
+    subs_save(subs)                                 # и при отписке тоже: иначе
+                                                    # удаление останется в памяти
     tg_call("answerCallbackQuery", {"callback_query_id": q["id"], "text": note})
     head, kb = tg_board(cid, slugs, names)
     tg_call("editMessageText", {"chat_id": cid, "message_id": mid, "text": head,
                                 "reply_markup": kb})
 
-def tg_poll(quiet=True):
+def tg_serve(args):
+    """Длинный опрос. Нажатие кнопки Telegram живёт считанные секунды:
+    разобранное через две минуты уже просрочено, и у человека вечно висит
+    «загрузка». Поэтому слушаем постоянно, а не по расписанию."""
+    auth()
+    ok("слушаю бота; остановить — Ctrl+C")
+    fresh = time.time()
+    while True:
+        try:
+            if time.time() - fresh > 1800:            # токен живёт не вечно
+                auth(); fresh = time.time()
+            n, err = tg_poll(long=True)
+            if err:
+                print(f"telegram: {err}", file=sys.stderr); time.sleep(5)
+        except KeyboardInterrupt:
+            ok("остановлен"); return
+        except Exception as e:
+            print(f"сбой: {e}", file=sys.stderr); time.sleep(5)
+
+def tg_poll(quiet=True, long=False):
     """Собрать написавших боту и ЗАПОМНИТЬ. Telegram держит непрочитанные
     обновления около суток: не опросили — факт подписки потерян навсегда.
     Поэтому опрос запоминает в конфиг и вызывается ежечасно дозорным."""
@@ -1893,7 +2005,8 @@ def tg_poll(quiet=True):
     # Смещение обязательно: без него Telegram отдаёт одни и те же сообщения
     # сутки подряд. Команда «стоп» без смещения через час отменилась бы сама.
     off = cfg_load().get("telegram_offset")
-    d = tg_call("getUpdates" + (f"?offset={off}&timeout=0" if off else ""))
+    q = [f"timeout={50 if long else 0}"] + ([f"offset={off}"] if off else [])
+    d = tg_call("getUpdates?" + "&".join(q), timeout=70 if long else 30)
     if not d.get("ok"): return 0, d.get("description")
     ups = d.get("result", [])
     slugs, names = set(), {}
@@ -1949,7 +2062,68 @@ def tg_poll(quiet=True):
     if last is not None: cfg_set("telegram_offset", last + 1)
     return new, None
 
+TGPOLL_LABEL = "kz.taiga-kit.tgpoll"
+
+def tgpoll_install(args):
+    """Частый опрос бота. Нужен ради кнопок: нажатие, обработанное через час,
+    выглядит как поломка. Один сетевой вызов, стоит копейки."""
+    exe = str(pathlib.Path(sys.argv[0]).resolve())
+    sec = max(30, int(args.every_sec))
+    log = HOME / ".taiga-kit"; log.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        name = "TaigaKitTgPoll"
+        if args.uninstall:
+            r = subprocess.run(["schtasks","/Delete","/TN",name,"/F"], capture_output=True, text=True)
+            ok("расписание снято" if not r.returncode else f"schtasks: {r.stdout}{r.stderr}"); return
+        r = subprocess.run(["schtasks","/Create","/TN",name,
+                            "/TR",f'"{sys.executable}" "{exe}" telegram --poll',
+                            "/SC","MINUTE","/MO",str(max(1, sec // 60)),"/F"],
+                           capture_output=True, text=True)
+        if r.returncode: die(f"schtasks: {r.stdout}{r.stderr}")
+        ok(f"опрос бота поставлен: каждые {max(1, sec // 60)} мин"); return
+    if sys.platform != "darwin":
+        if args.uninstall: return cron_job("tgpoll", [], True)
+        ok("для systemd заведите службу, которая держит запущенным:")
+        ok(f"  {sys.executable} {exe} telegram --serve")
+        ok("или, грубее, раз в минуту через cron (кнопки будут тормозить):")
+        return cron_job("tgpoll", [("* * * * *", ["telegram", "--poll"])], False)
+    plist = HOME / "Library" / "LaunchAgents" / f"{TGPOLL_LABEL}.plist"
+    if args.uninstall:
+        subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+        if plist.exists(): plist.unlink()
+        ok(f"расписание снято: {plist}"); return
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{TGPOLL_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{exe}</string><string>telegram</string><string>--serve</string></array>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>{log}/tgpoll.log</string>
+  <key>StandardErrorPath</key><string>{log}/tgpoll.log</string>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+""")
+    subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+    r = subprocess.run(["launchctl","load",str(plist)], capture_output=True, text=True)
+    if r.returncode: die(f"launchctl: {r.stderr.strip()}")
+    ok(f"слушатель бота запущен: {plist}")
+    ok("держится постоянно (KeepAlive); кнопки отзываются за секунду")
+    ok("снять: taiga telegram --uninstall")
+
 def cmd_telegram(args):
+    if args.install or args.uninstall: return tgpoll_install(args)
+    if args.serve: return tg_serve(args)
+    if args.poll:
+        auth()
+        n, err = tg_poll()
+        if err: die(f"Telegram: {err}")
+        if n: ok(f"новых подписок: {n}")
+        return
     if args.discover:
         n, err = tg_poll()
         if err: die(f"Telegram: {err}")
@@ -2269,6 +2443,8 @@ def notify_columns(args, seen):
     c, users = api("GET", "/users")
     un = {u["id"]: (u.get("full_name_display") or u.get("username")) for u in (users or [])}
     c, projects = api("GET", "/projects")
+    k = subs_sync({p["slug"] for p in (projects or [])})
+    if k: ok(f"подписки свёрены со списком проектов: изменилось {k}")
     fresh = {}
     for p in (projects or []):
         pid, pslug, pname = p["id"], p["slug"], p["name"]
@@ -2307,13 +2483,15 @@ def notify_columns(args, seen):
         for nm in want[col_l]:
             t = by_name.get(nm.lower()) or next(
                 (v for k, v in by_name.items() if nm.lower() in k), None)
-            if t: targets.append({"chat_id": t["chat_id"], "name": t["name"], "projects": []})
+            # None — «все проекты»: список администратора не фильтруется.
+            if t: targets.append({"chat_id": t["chat_id"], "name": t["name"], "projects": None})
             else: ok(f"колонка «{col}»: «{nm}» не подключён к боту — пропускаю")
         have = {t["chat_id"] for t in targets}
         for cid, sb in subs_load().items():
             if int(cid) in have: continue
+            if not sb.get("instant", True): continue      # он подписан только на вечер
             targets.append({"chat_id": int(cid), "name": sb.get("name") or cid,
-                            "projects": sb.get("projects") or []})
+                            "projects": list(sb.get("projects") or [])})
         if not targets:
             # Отметку ставим всё равно: иначе первый подписавшийся получит
             # всё, что накопилось, пока получателей не было.
@@ -2333,9 +2511,12 @@ def notify_columns(args, seen):
             return ["\n".join(L).strip()]
         touched = False
         for t in targets:
-            mine = [x for x in items if not t["projects"] or x["slug"] in t["projects"]]
+            mine = (items if t["projects"] is None
+                    else [x for x in items if x["slug"] in t["projects"]])
             if not mine:
-                ok(f"  колонка «{col}» → {t['name']}: ничего по его проектам"); continue
+                ok(f"  колонка «{col}» → {t['name']}: "
+                   + ("проекты не отмечены" if t["projects"] == [] else "ничего по его проектам"))
+                continue
             okall = True
             for txt in compose(mine):
                 r = tg_call("sendMessage", {"chat_id": t["chat_id"], "text": txt,
@@ -2346,7 +2527,7 @@ def notify_columns(args, seen):
             if okall:
                 touched = True
                 ok(f"  колонка «{col}» → {t['name']}: {len(mine)} шт."
-                   + ("" if not t["projects"] else f" (из {len(items)})"))
+                   + ("" if t["projects"] is None else f" (из {len(items)})"))
         for x in items: seen[x["key"]] = True
         if touched: sent += len(items)
         notify_save(seen)
@@ -2777,6 +2958,124 @@ def recon_install(args):
     ok("снять: taiga recon --uninstall")
 
 
+# ── еженедельные карточки встреч руководителей ──────────────────────────────
+# Было отдельным скриптом с собственной обвязкой и собственным заданием,
+# хотя всё, что он делал, — звал `taiga apply`. Перенесено сюда: одна
+# программа, одно расписание, один журнал.
+RITUAL_PM = ["Владимир Меньшагин", "Михаил Степанов", "Михаил Чечушков", "Мурат Омаров"]
+RITUAL_DAYS = ["пн", "вт", "ср", "чт", "пт"]
+
+LINKS = """Задачи — ссылками на карточки Taiga (адрес из строки браузера).
+Голый номер не годится: #268 есть в нескольких проектах."""
+
+PLANNING = """Еженедельное планирование с командой (понедельник).
+
+Цели недели:
+
+### Участник: ____________
+- [название задачи](ссылка) — срок
+
+### Участник: ____________
+- [название задачи](ссылка) — срок
+
+Риски:
+
+""" + LINKS
+
+MEMBER_BLOCK = """### Участник: ____________
+1. Сделано:
+2. План:
+3. Вопросы:
+"""
+
+DAILY = """Ежедневный чек-статус с командой.
+Блок на каждого участника созвона: лишние удалите, недостающие скопируйте.
+Имя — как в Taiga. Нечего писать — поставьте тире, пункт не удаляйте.
+
+""" + "\n".join([MEMBER_BLOCK] * 5) + """
+### Итоги созвона
+- Решения:
+- Блокеры и кто их снимает:
+
+""" + LINKS + """
+
+Пункт «План» разбирается автоматически для вечерней сводки «план против факта» —
+он должен состоять из ссылок. Регламент: РЕГЛАМЕНТ-карточек-PM.md
+В Done — после того, как дейлик проведён и карточка заполнена."""
+
+RETRO = """Еженедельная ретроспектива (пятница).
+
+- что сделано;
+- что не сделано и по какой причине;
+- выводы и действия на следующую неделю."""
+
+
+
+RITUAL_LABEL = "kz.taiga-kit.rituals"
+
+def ritual_plan(mon, managers, slug):
+    fmt = lambda d: d.strftime("%d.%m.%Y")
+    import datetime
+    stories = []
+    for pm in managers:
+        stories.append({"subject": f"Планирование недели {fmt(mon)} — {pm}",
+                        "description": PLANNING, "assign": pm})
+        for i, name in enumerate(RITUAL_DAYS):
+            d = mon + datetime.timedelta(days=i)
+            stories.append({"subject": f"Чек-статус {name} {fmt(d)} — {pm}",
+                            "description": DAILY, "assign": pm})
+        stories.append({"subject": f"Ретроспектива недели {fmt(mon)} — {pm}",
+                        "description": RETRO, "assign": pm})
+    return {"project": slug, "stories": stories}
+
+def cmd_rituals(args):
+    import datetime
+    if args.install or args.uninstall:
+        exe = str(pathlib.Path(sys.argv[0]).resolve())
+        if sys.platform != "darwin":
+            return cron_job("rituals", [("0 8 * * 1", ["rituals"])], args.uninstall)
+        plist = HOME / "Library" / "LaunchAgents" / f"{RITUAL_LABEL}.plist"
+        if args.uninstall:
+            subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+            if plist.exists(): plist.unlink()
+            ok(f"расписание снято: {plist}"); return
+        log = HOME / ".taiga-kit"; log.mkdir(parents=True, exist_ok=True)
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{RITUAL_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{exe}</string><string>rituals</string></array>
+  <key>StartCalendarInterval</key>
+  <array><dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer>
+  <key>Minute</key><integer>0</integer></dict></array>
+  <key>StandardOutPath</key><string>{log}/rituals.log</string>
+  <key>StandardErrorPath</key><string>{log}/rituals.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+""")
+        subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+        r = subprocess.run(["launchctl","load",str(plist)], capture_output=True, text=True)
+        if r.returncode: die(f"launchctl: {r.stderr.strip()}")
+        ok(f"расписание поставлено: понедельник 08:00 · {plist}"); return
+    auth()
+    day = datetime.date.fromisoformat(args.week) if args.week else datetime.date.today()
+    mon = day - datetime.timedelta(days=day.weekday())
+    managers = ([x.strip() for x in args.managers.split(",") if x.strip()] if args.managers
+                else cfg_load().get("ritual_managers") or RITUAL_PM)
+    if args.managers: cfg_set("ritual_managers", managers)
+    slug = args.project or cfg_load().get("ritual_project", "projectmanager")
+    d = ritual_plan(mon, managers, slug)
+    f = HOME / ".taiga-kit" / f"rituals-{mon.isoformat()}.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+    ok(f"неделя {mon:%d.%m.%Y} · руководителей {len(managers)} · карточек {len(d['stories'])}")
+    ns = argparse.Namespace(file=str(f), project=slug, yes=True, kind="us")
+    return cmd_plan(ns) if args.dry else cmd_apply(ns)
+
 def cmd_watch(args):
     import datetime
     if args.install or args.uninstall: return watch_install(args)
@@ -3013,11 +3312,23 @@ def main():
     rc.add_argument("--start", default="9", metavar="Ч")
     rc.add_argument("--end", default="19", metavar="Ч")
     rc.set_defaults(fn=cmd_recon)
+    rt = P("rituals")
+    rt.add_argument("--week", help="любая дата нужной недели, ГГГГ-ММ-ДД")
+    rt.add_argument("--managers", metavar="ИМЕНА", help="через запятую (запоминается)")
+    rt.add_argument("--dry", action="store_true", help="показать, ничего не создавая")
+    rt.add_argument("--install", action="store_true", help="расписание: понедельник 08:00")
+    rt.add_argument("--uninstall", action="store_true")
+    rt.set_defaults(fn=cmd_rituals)
     tg = P("telegram")
     tg.add_argument("--discover", action="store_true", help="кто писал боту: имена и chat_id")
     tg.add_argument("--add", nargs=2, metavar=("ИМЯ","CHAT_ID"), help="связать человека с чатом")
     tg.add_argument("--remove", metavar="ИМЯ", help="убрать получателя")
     tg.add_argument("--test", action="store_true", help="отправить всем проверочное сообщение")
+    tg.add_argument("--poll", action="store_true", help="разобрать накопившееся и выйти")
+    tg.add_argument("--serve", action="store_true", help="слушать бота постоянно (длинный опрос)")
+    tg.add_argument("--install", action="store_true", help="частый опрос бота (ради кнопок)")
+    tg.add_argument("--uninstall", action="store_true")
+    tg.add_argument("--every-sec", default="120", metavar="СЕК", help="период опроса, по умолчанию 120")
     tg.set_defaults(fn=cmd_telegram)
     rg = P("registry"); rg.add_argument("--forget", metavar="СЛАГ", help="убрать проект из реестра")
     rg.add_argument("--scan", nargs="?", const="", metavar="ПУТЬ",
