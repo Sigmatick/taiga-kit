@@ -2833,6 +2833,14 @@ def find_exe(name):
             if c.exists(): return str(c)
     return None
 
+CLAUDE_TOKEN_FILE = HOME / ".taiga-kit" / "claude.token"
+
+def claude_token():
+    p = pathlib.Path(os.path.expanduser(cfg_load().get("claude_token_file",
+                                                       str(CLAUDE_TOKEN_FILE))))
+    try: return p.read_text().strip() or None
+    except Exception: return None
+
 def recon_env():
     """Окружение для дочернего claude. Переменные нашей сессии ему вредят:
     ANTHROPIC_BASE_URL указывает на прокси, обновлять токен к которому умеет
@@ -2840,6 +2848,11 @@ def recon_env():
     e = dict(os.environ)
     for k in list(e):
         if k.startswith(("CLAUDE", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH")): e.pop(k, None)
+    # Долгоживущий токен кладём ПОСЛЕ очистки: иначе его бы стёрло вместе
+    # с остальными CLAUDE*. Без него вход зависит от десктопного приложения
+    # и слетает при каждом его перезапуске.
+    t = claude_token()
+    if t: e["CLAUDE_CODE_OAUTH_TOKEN"] = t
     return e
 
 def recon_run(stub, timeout, cmd, model=None):
@@ -2917,6 +2930,16 @@ def recon_gist(out, n=3):
 def cmd_recon(args):
     import datetime
     if args.install or args.uninstall: return recon_install(args)
+    if args.token:
+        # Ввод скрытый и из терминала: в переписке и в истории команд
+        # токену не место. Файл — только для владельца.
+        if not sys.stdin.isatty(): die("ввод токена требует терминала")
+        v = getpass.getpass("Токен от `claude setup-token` (ввод не виден): ").strip()
+        if not v: die("пусто — ничего не записано")
+        write_secret(CLAUDE_TOKEN_FILE, v)
+        ok(f"токен записан: {CLAUDE_TOKEN_FILE} (права 600)")
+        ok("проверка:  taiga recon --dry")
+        return
     reg = reg_load()
     if not reg: die("реестр пуст — выполните `taiga registry --scan`")
     cfg = cfg_load()
@@ -3408,6 +3431,8 @@ def main():
     rc.add_argument("--max-run", help="сколько тикетов за прогон, по умолчанию 3")
     rc.add_argument("--max-day", help="сколько тикетов в сутки, по умолчанию 10")
     rc.add_argument("--dry", action="store_true", help="показать, модель не запускать")
+    rc.add_argument("--token", action="store_true",
+                    help="ввести долгоживущий токен от `claude setup-token`")
     rc.add_argument("--send", action="store_true", help="разослать итог в Telegram")
     rc.add_argument("--install", action="store_true", help="расписание: будни, каждые 2 ч")
     rc.add_argument("--uninstall", action="store_true")
