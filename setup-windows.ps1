@@ -79,8 +79,32 @@ if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
 if (-not $py) { $py = Get-Command py -ErrorAction SilentlyContinue }
 if (-not $py) { Fail 'нет Python. Поставьте с python.org и ОБЯЗАТЕЛЬНО отметьте "Add Python to PATH"' }
 Write-Host "  python:  $(& $py.Source --version)"
-if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { Fail 'нет Claude Code. Поставьте его и запустите файл снова.' }
-Write-Host "  claude:  $((claude --version) -split "`n" | Select-Object -First 1)"
+# Десктопное приложение на Windows не кладёт claude в PATH — у людей
+# установщик падал, хотя Claude Code стоял. Ищем сами, а не найдя,
+# НЕ прерываемся: программа и вход нужны и без плагина.
+$script:Claude = $null
+$c = Get-Command claude -ErrorAction SilentlyContinue
+if ($c) { $script:Claude = $c.Source }
+else {
+    foreach ($p in @(
+        "$env:USERPROFILE\.local\bin\claude.exe",
+        "$env:USERPROFILE\.local\bin\claude.cmd",
+        "$env:APPDATA\npm\claude.cmd",
+        "$env:LOCALAPPDATA\Programs\claude\claude.exe",
+        "$env:LOCALAPPDATA\Programs\Claude\claude.exe",
+        "$env:ProgramFiles\Claude\claude.exe")) {
+        if (Test-Path $p) { $script:Claude = $p; break }
+    }
+}
+if ($script:Claude) {
+    $v = & $script:Claude --version 2>$null | Select-Object -First 1
+    Write-Host "  claude:  $v"
+} else {
+    Warn '  claude в PATH не найден.'
+    Write-Host '  Десктопное приложение Claude само в PATH не прописывается.'
+    Write-Host '  Плагин я поставить не смогу — остальное установлю.'
+    Write-Host '  Поставить командную строку: npm i -g @anthropic-ai/claude-code'
+}
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Warn '  git не найден — связь задач с коммитами работать не будет' }
 if ($script:Restricted) {
     Warn "  PowerShell в режиме $($ExecutionContext.SessionState.LanguageMode) — часть шагов пропущу"
@@ -105,13 +129,15 @@ Write-Host "  выбрано: $(if ($role -eq 'dev') {'разработчик'} 
 
 # ── 2. плагин ───────────────────────────────────────────────────────────────
 Bold 'Шаг 2 из 5. Плагин Claude Code'
-if ((claude plugin list 2>$null) -match 'taiga-kit') {
+if (-not $script:Claude) {
+    Warn '  пропускаю: claude не найден. Поставьте его и запустите установщик снова.'
+} elseif ((& $script:Claude plugin list 2>$null) -match 'taiga-kit') {
     Write-Host '  уже установлен'
 } else {
     Write-Host '  подключаю каталог и ставлю плагин…'
-    try   { claude plugin marketplace add Sigmatick/taiga-kit 2>$null | Out-Null }
-    catch { try { claude plugin marketplace add $src 2>$null | Out-Null } catch { Warn '  каталог подключить не удалось' } }
-    try   { claude plugin install taiga-kit@taiga-kit 2>$null | Out-Null; Write-Host '  плагин установлен' }
+    try   { & $script:Claude plugin marketplace add Sigmatick/taiga-kit 2>$null | Out-Null }
+    catch { try { & $script:Claude plugin marketplace add $src 2>$null | Out-Null } catch { Warn '  каталог подключить не удалось' } }
+    try   { & $script:Claude plugin install taiga-kit@taiga-kit 2>$null | Out-Null; Write-Host '  плагин установлен' }
     catch { Warn '  плагин не установился — см. README' }
 }
 

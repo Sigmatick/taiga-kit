@@ -775,6 +775,49 @@ def cmd_sync(args):
 STUB_TITLES = {"другие задачи", "прочее", "разное", "задачи", "тест", "test",
                "экспорт", "импорт", "доработки", "правки", "баги", "fix", "todo"}
 
+# ── стандарт оформления тикетов ────────────────────────────────────────────
+# Проверки взяты из «Стандарта оформления тикетов в Taiga — EGSV MEGACAM»
+# (Л. Самборский, QA, 08.10.2026). Сам стандарт живёт у тестировщиков:
+# это процесс компании, а не поведение инструмента. Здесь — только то,
+# что проверяется механически, без догадок.
+TICKET_SECTIONS = ("ОКРУЖЕНИЕ", "РЕПРО", "ОЖИДАЛОСЬ", "ФАКТИЧЕСКИ")
+SEVERITIES = ("blocker", "critical", "major", "minor", "trivial")
+TEAMS = ("бэк", "фронт", "инфра", "sec", "мобилка", "qa")
+# Пароль в описании — это утечка, а не огрех оформления. Ищем «ключ: значение»,
+# иначе сработает на каждом «забыл пароль» в тексте бага.
+SECRET_RE = re.compile(r"(?i)(пароль|password|passwd|token|токен|api[ _-]?key|secret|credential)"
+                       r"\s*[:=]\s*\S{4,}")
+STEP_RE = re.compile(r"^\s*1\s*[.)]\s*\S", re.M)
+
+def triage_bug(subj, desc, full):
+    """Замечания к баг-репорту по стандарту. Только для карточек в BUG.
+
+    Вложений нет у 52 багов из 53 — проверено на живых данных. Такое
+    замечание в каждой карточке не замечание, а шум, после которого
+    перестают читать весь список. Поэтому оно идёт общей строкой
+    в конце разбора, а не меткой на каждой."""
+    flags = []
+    low = desc.lower()
+    if not re.match(r"^\s*\[[^\]]{2,40}\]\s*\S", subj):
+        flags.append("заголовок без «[Раздел/Команда] суть»")
+    miss = [x for x in TICKET_SECTIONS if x.lower() not in low]
+    if len(miss) == len(TICKET_SECTIONS):
+        flags.append("описание не по шаблону: нет ни одного раздела "
+                     "(ОКРУЖЕНИЕ, РЕПРО, ОЖИДАЛОСЬ, ФАКТИЧЕСКИ)")
+    elif miss:
+        flags.append("нет разделов: " + ", ".join(miss))
+    if "репро" in low and not STEP_RE.search(desc):
+        flags.append("шаги воспроизведения не пронумерованы")
+    tags = " ".join(str(t[0] if isinstance(t, (list, tuple)) else t)
+                    for t in (full.get("tags") or [])).lower()
+    if not (any(x in tags for x in SEVERITIES) or "severity" in low):
+        flags.append("не указана severity — ни в тегах, ни в описании")
+    if not (any(x in tags for x in TEAMS) or "команда" in low):
+        flags.append("не указана команда — ни в тегах, ни в описании")
+    if SECRET_RE.search(desc):
+        flags.append("⚠ в описании похоже на пароль или токен — убрать немедленно")
+    return flags
+
 def triage_item(o, full, kids_desc, closed_ids):
     """Список замечаний к единице работы. Пусто — вопросов нет."""
     flags = []
@@ -788,10 +831,9 @@ def triage_item(o, full, kids_desc, closed_ids):
     if not o.get("assigned_to") and o["status"] not in closed_ids:
         flags.append("не назначена ни на кого")
     st = (o.get("status_extra_info") or {}).get("name", "").lower()
-    if "bug" in st and has_text:
-        low = (desc + " " + subj).lower()
-        if not any(w in low for w in ("ожида", "должн", "expected", "воспроизв", "шаг")):
-            flags.append("баг без ожидаемого поведения и шагов воспроизведения")
+    if "bug" in st:
+        if has_text: flags += triage_bug(subj, desc, full)
+        else: flags.append("баг без описания — по стандарту нужны шаги, окружение и роль")
     return flags
 
 def cmd_triage(args):
@@ -818,7 +860,7 @@ def _triage_one(args):
     for k in (tks or []):
         if k.get("user_story"): kids.setdefault(k["user_story"], []).append(k)
 
-    total = 0; rows = []
+    total = 0; rows = []; bugs = 0; noatt = 0
     for kind, ep in (("us","userstory-statuses"),
                      ("task","task-statuses"),
                      ("issue","issue-statuses")):
@@ -835,9 +877,15 @@ def _triage_one(args):
                     c, kf = api("GET", f"/tasks/{k['id']}")
                     if len((kf.get("description") or "").strip()) >= 80: kd = True; break
             fl = triage_item(o, full, kd, closed_ids)
+            st_name = (o.get("status_extra_info") or {}).get("name", "").lower()
+            if "bug" in st_name:
+                bugs += 1
+                if not (full.get("attachments") or []): noatt += 1
             if fl: rows.append((kind, o, fl))
 
     ok(f"{p['name']}: новых за {args.days} дн — {total}, с замечаниями — {len(rows)}")
+    if noatt:
+        ok(f"  без вложений (скрины, видео, MD-разбор): {noatt} багов из {bugs}")
     if not rows:
         ok("всё оформлено достаточно для работы"); return
     for kind, o, fl in sorted(rows, key=lambda x: -x[1]["ref"]):
@@ -1028,6 +1076,8 @@ def watch_install(args):
   <key>StartCalendarInterval</key>
   <array>
 {hours}  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{os.path.expanduser("~/.local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StandardOutPath</key><string>{log}/watch.log</string>
   <key>StandardErrorPath</key><string>{log}/watch.log</string>
   <key>RunAtLoad</key><false/>
@@ -1118,6 +1168,8 @@ def report_install(args):
   <key>StartCalendarInterval</key>
   <array>
 {days}  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{os.path.expanduser("~/.local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StandardOutPath</key><string>{log}/report.log</string>
   <key>StandardErrorPath</key><string>{log}/report.log</string>
   <key>RunAtLoad</key><false/>
@@ -1581,6 +1633,8 @@ def standup_install(args):
   <key>StartCalendarInterval</key>
   <array>
 {days}  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{os.path.expanduser("~/.local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StandardOutPath</key><string>{log}/standup.log</string>
   <key>StandardErrorPath</key><string>{log}/standup.log</string>
   <key>RunAtLoad</key><false/>
@@ -2117,6 +2171,8 @@ def tgpoll_install(args):
   <array><string>{sys.executable}</string><string>{exe}</string><string>telegram</string><string>--serve</string></array>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{os.path.expanduser("~/.local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StandardOutPath</key><string>{log}/tgpoll.log</string>
   <key>StandardErrorPath</key><string>{log}/tgpoll.log</string>
   <key>RunAtLoad</key><true/>
@@ -2323,6 +2379,8 @@ def digest_install(args):
   <key>StartCalendarInterval</key>
   <array>
 {days}  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{os.path.expanduser("~/.local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StandardOutPath</key><string>{log}/digest.log</string>
   <key>StandardErrorPath</key><string>{log}/digest.log</string>
   <key>RunAtLoad</key><false/>
@@ -2421,6 +2479,8 @@ def notify_install(args):
   <key>StartCalendarInterval</key>
   <array>
 {hours}  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{os.path.expanduser("~/.local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StandardOutPath</key><string>{log}/notify.log</string>
   <key>StandardErrorPath</key><string>{log}/notify.log</string>
   <key>RunAtLoad</key><false/>
@@ -2757,6 +2817,22 @@ def recon_stubs(reg, only_slug=None, only_ref=None):
     out.sort(key=lambda x: (not x["assigned"], -x["ref"]))
     return out
 
+# launchd и cron дают почти пустой PATH: «claude» там не найдётся, и
+# разведка молча падала каждый час. Ищем сами, по тем местам, куда его
+# реально ставят.
+EXE_DIRS = ["~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin",
+            "~/.claude/local", "~/.bun/bin", "~/.npm-global/bin", "/usr/bin",
+            "~/AppData/Roaming/npm", "~/AppData/Local/Programs/claude"]
+
+def find_exe(name):
+    p = shutil.which(name)
+    if p: return p
+    for d in EXE_DIRS:
+        for suf in ("", ".cmd", ".exe"):
+            c = pathlib.Path(os.path.expanduser(d)) / (name + suf)
+            if c.exists(): return str(c)
+    return None
+
 def recon_env():
     """Окружение для дочернего claude. Переменные нашей сессии ему вредят:
     ANTHROPIC_BASE_URL указывает на прокси, обновлять токен к которому умеет
@@ -2778,7 +2854,8 @@ def recon_run(stub, timeout, cmd, model=None):
         st=g(r"статус в трекере: (.+?) ·", "?"),
         who=g(r"исполнитель: (.+)$", "?"),
         desc=body or "_описания в тикете нет_")
-    argv = [cmd, "-p", "--allowedTools", "Read", "Grep", "Glob",
+    exe = find_exe(cmd) or cmd
+    argv = [exe, "-p", "--allowedTools", "Read", "Grep", "Glob",
             "--permission-mode", "default", "--max-turns", "20"]
     if model: argv += ["--model", model]
     try:
@@ -2787,7 +2864,8 @@ def recon_run(stub, timeout, cmd, model=None):
     except subprocess.TimeoutExpired:
         return None, f"не уложилась в {timeout} с"
     except FileNotFoundError:
-        return None, f"программа «{cmd}» не найдена"
+        return None, (f"программа «{cmd}» не найдена. Искал в PATH и в "
+                      + ", ".join(EXE_DIRS[:4]) + ". Задайте путь: recon_cmd в конфиге")
     out = (r.stdout or "").strip()
     if r.returncode != 0:
         return None, ((r.stderr or out).strip().splitlines() or ["код " + str(r.returncode)])[0][:200]
@@ -2959,6 +3037,8 @@ def recon_install(args):
   <key>StartCalendarInterval</key>
   <array>
 {hours}  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{os.path.expanduser("~/.local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StandardOutPath</key><string>{log}/recon.log</string>
   <key>StandardErrorPath</key><string>{log}/recon.log</string>
   <key>RunAtLoad</key><false/>
@@ -3069,6 +3149,8 @@ def cmd_rituals(args):
   <key>StartCalendarInterval</key>
   <array><dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer>
   <key>Minute</key><integer>0</integer></dict></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{os.path.expanduser("~/.local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StandardOutPath</key><string>{log}/rituals.log</string>
   <key>StandardErrorPath</key><string>{log}/rituals.log</string>
   <key>RunAtLoad</key><false/>
