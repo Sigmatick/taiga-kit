@@ -28,6 +28,10 @@ $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 
 $src = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Режим языка определяет, что нам вообще позволено. Читать его можно всегда.
+$script:Restricted = $false
+try { $script:Restricted = ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') } catch { }
 $bin = Join-Path $env:USERPROFILE '.local\bin'
 $env:PATH = "$bin;$env:PATH"
 
@@ -55,6 +59,10 @@ Write-Host "  python:  $(& $py.Source --version)"
 if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { Fail 'нет Claude Code. Поставьте его и запустите файл снова.' }
 Write-Host "  claude:  $((claude --version) -split "`n" | Select-Object -First 1)"
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Warn '  git не найден — связь задач с коммитами работать не будет' }
+if ($script:Restricted) {
+    Warn "  PowerShell в режиме $($ExecutionContext.SessionState.LanguageMode) — часть шагов пропущу"
+    Write-Host '  Это политика вашей организации, не поломка. Установка пройдёт.'
+}
 
 # ── роль ──
 Bold 'Кто вы?'
@@ -100,10 +108,26 @@ set PYTHONIOENCODING=utf-8
 
 Write-Host "  установлена: $bin\taiga.cmd"
 
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-if ($userPath -notlike "*$bin*") {
-    [Environment]::SetEnvironmentVariable('Path', "$bin;$userPath", 'User')
-    Write-Host '  путь дописан в PATH (подействует в новых окнах консоли)'
+# В ограниченном языковом режиме (политика WDAC/AppLocker) доступ к типам
+# .NET запрещён, и правка PATH упала бы с невнятной ошибкой. Это не повод
+# прерывать установку: внутри Claude Code программа всё равно находится
+# по пути плагина, PATH нужен только для вызова из терминала вручную.
+if ($script:Restricted) {
+    Warn '  PATH не меняю: PowerShell в ограниченном режиме'
+    Write-Host '  На работу в Claude Code это не влияет.'
+    Write-Host "  Нужен вызов 'taiga' из терминала — добавьте в PATH вручную:"
+    Write-Host "     $bin"
+} else {
+    try {
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if ($userPath -notlike "*$bin*") {
+            [Environment]::SetEnvironmentVariable('Path', "$bin;$userPath", 'User')
+            Write-Host '  путь дописан в PATH (подействует в новых окнах консоли)'
+        }
+    } catch {
+        Warn "  PATH дописать не удалось: $_"
+        Write-Host "  Добавьте вручную, если нужен вызов из терминала:  $bin"
+    }
 }
 
 # ── 4. вход ─────────────────────────────────────────────────────────────────
