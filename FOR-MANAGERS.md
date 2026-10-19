@@ -86,15 +86,21 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 подключи эту папку к проекту domcom
 ```
 
-Слаг (`domcom`) — то, что стоит в адресе браузера между `/project/` и следующим слэшем:
+**Слаг — одно слово сразу после `/project/`,** до следующей косой черты. Всё, что
+дальше, — это страница, на которую вы зашли, а не часть слага:
 
-```
-https://<инстанс>/project/domcom/kanban
-                          ^^^^^^
-```
+| Адрес | Слаг |
+|---|---|
+| `…/project/domcom/kanban` | `domcom` |
+| `…/project/egsv/us/159` | `egsv` |
+| `…/project/digital-police/task/294?kanban-status=12` | `digital-police` |
+| `…/project/projectmanager/backlog` | `projectmanager` |
 
-Не название из интерфейса: проект могли переименовать, а адрес остался прежним.
-Не знаете слаг — спросите «покажи список проектов».
+Дефис входит в слаг целиком: `digital-police`, `argus-control`.
+
+**Слаг не равен названию.** `argus-control` в интерфейсе называется «Engineering
+department»: проект переименовали, а адрес остался. Не знаете слаг — спросите
+«покажи список проектов».
 
 ## Что происходит при записи
 

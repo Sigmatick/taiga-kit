@@ -201,8 +201,12 @@ Bold 'Шаг 5 из 5. Подключение проекта'
 if ($LASTEXITCODE -ne 0) { Fail 'список проектов не получен' }
 
 Write-Host ''
-Write-Host '  Слаг — это левый столбец. В адресе браузера он же:'
-Write-Host '  https://<инстанс>/project/СЛАГ/kanban'
+Write-Host '  Слаг — одно слово сразу после /project/, до следующей косой черты.'
+Write-Host '  Всё, что дальше, — страница, а не часть слага:'
+Write-Host '     .../project/domcom/kanban            -> domcom'
+Write-Host '     .../project/egsv/us/159              -> egsv'
+Write-Host '     .../project/digital-police/task/294  -> digital-police'
+Write-Host '  Дефис входит в слаг. Слаг не равен названию: проект могли переименовать.'
 Write-Host ''
 $slug = Read-Host '  слаг проекта (пусто — пропустить)'
 

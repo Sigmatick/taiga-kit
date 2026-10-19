@@ -126,8 +126,12 @@ fi
 bold "Шаг 5 из 5. Подключение проекта"
 "$BIN/taiga" projects || fail "список проектов не получен"
 echo
-echo "  Слаг — это левый столбец. В адресе браузера он же:"
-echo "  https://<инстанс>/project/СЛАГ/kanban"
+echo "  Слаг — одно слово сразу после /project/, до следующей косой черты."
+echo "  Всё, что дальше, — страница, а не часть слага:"
+echo "     .../project/domcom/kanban            -> domcom"
+echo "     .../project/egsv/us/159              -> egsv"
+echo "     .../project/digital-police/task/294  -> digital-police"
+echo "  Дефис входит в слаг. Слаг не равен названию: проект могли переименовать."
 echo
 read -r -p "  слаг проекта (пусто — пропустить): " SLUG
 if [ -n "$SLUG" ]; then
