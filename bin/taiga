@@ -2116,6 +2116,14 @@ TG_HELP = (
 )
 
 def subs_load(): return cfg_load().get("column_subs", {})
+
+def subs_defaults(e):
+    """Режимы хранятся явно. Раньше текстовая подписка их не ставила,
+    и выходило расхождение: клавиатура показывала «сразу: нет», а рассылка
+    считала «да» по своему умолчанию. Одно умолчание на всех — здесь."""
+    e.setdefault("instant", True)
+    e.setdefault("evening", False)
+    return e
 def subs_save(d): cfg_set("column_subs", d)
 
 def tg_cmd(cid, text, slugs, names):
@@ -2161,9 +2169,11 @@ def tg_cmd(cid, text, slugs, names):
 
     if arg.lower() in ("все", "всё", "all", "*"):
         me["projects"] = sorted(slugs); me["all"] = True
+        subs_defaults(me)
     else:
         want = [x.strip().lower() for x in re.split(r"[,\s]+", arg) if x.strip()]
         me["all"] = False
+        subs_defaults(me)
         good = [x for x in want if x in slugs]
         bad = [x for x in want if x not in slugs]
         if not good:
@@ -2207,7 +2217,7 @@ def tg_board(cid, slugs, names):
     # Показываем ровно то, что лежит в памяти. Раньше у неподписанного
     # кнопка рисовалась включённой, а хранилось «выключено»: нажатие её
     # включало, вид не менялся — выглядело как поломка.
-    inst = bool((sub or {}).get("instant", False))
+    inst = bool(sub.get("instant", True)) if sub else False
     eve = bool((sub or {}).get("evening", False))
     rows = [[{"text": "\u2705 \U0001F9EA сразу: ДА" if inst else "\u2B1C \U0001F9EA сразу: нет",
               "callback_data": "p:*inst"},
@@ -2294,8 +2304,7 @@ def tg_tap(q, slugs, names):
     else:
         return                                      # кнопка не наша — молчим
     if key in subs:
-        subs[key].setdefault("instant", True)       # по умолчанию — как тестировщику
-        subs[key].setdefault("evening", False)
+        subs_defaults(subs[key])
         if not subs[key].get("name"):
             c = msg.get("chat") or {}
             subs[key]["name"] = (" ".join(x for x in (c.get("first_name"), c.get("last_name")) if x)
