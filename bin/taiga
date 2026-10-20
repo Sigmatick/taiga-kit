@@ -1524,6 +1524,115 @@ def support_tg(rows):
                     sorted(by.items(), key=lambda kv: -len(kv[1]))[:5])
     return ["", f"\U0001F527 Операционка: записей {len(rows)} · {top}"]
 
+# ── недельная цель и ежедневные задачи внутри неё ──────────────────────────
+# Руководитель в «Планировании недели» ставит ссылку на историю, а в дейликах
+# называет задачи внутри неё. Связать одно с другим можно: у задачи есть
+# user_story_extra_info с ref и названием родителя, отдельного запроса нет.
+WEEK_RE = re.compile(r"^Планирование недели\s+(\d{2})\.(\d{2})\.(\d{4})\s*[—–-]\s*(.+?)\s*$")
+
+def week_links(desc):
+    """Все ссылки на карточки из недельной карточки. Разделов там нет,
+    поэтому берём весь текст: план недели — это и есть список целей."""
+    seen, out = set(), []
+    for s, k, r in LINK_RE.findall(desc or ""):
+        t = (s.lower(), k, int(r))
+        if t not in seen: seen.add(t); out.append(t)
+    return out
+
+def week_story(goal, cache):
+    """Привести цель к истории: ссылка на задачу — берём её родителя."""
+    it = standup_lookup(goal[0], goal[1], goal[2], cache)
+    if not it: return None
+    if goal[1] != "task": return it
+    pid = cache["pid"].get(goal[0])
+    c, o = api("GET", f"/tasks/by_ref?ref={goal[2]}&project={pid}")
+    ex = (o or {}).get("user_story_extra_info") or {}
+    if not ex.get("ref"): return it            # задача без истории — цель как есть
+    par = standup_lookup(goal[0], "us", ex["ref"], cache)
+    return par or it
+
+def week_tasks(slug, us_ref, cache):
+    """Задачи внутри истории с их статусами. Список задач проекта кэшируем:
+    по одной истории он читается один раз, а не на каждую цель."""
+    pid = cache["pid"].get(slug)
+    if not pid: return []
+    if slug not in cache.setdefault("tasks", {}):
+        c, tks = api("GET", f"/tasks?project={pid}", nopage=True)
+        c, st = api("GET", f"/task-statuses?project={pid}")
+        cache["tasks"][slug] = (tks or [],
+                                {x["id"]: (x["name"], x.get("is_closed", False)) for x in (st or [])})
+    tks, cat = cache["tasks"][slug]
+    out = []
+    for t in tks:
+        ex = t.get("user_story_extra_info") or {}
+        if ex.get("ref") != us_ref: continue
+        nm, closed = cat.get(t["status"], ("?", False))
+        out.append({"ref": t["ref"], "subject": t.get("subject") or "",
+                    "status": nm, "closed": closed, "modified": t.get("modified_date")})
+    return sorted(out, key=lambda x: x["ref"])
+
+def week_block(goals, daily_refs, cache, monday, day):
+    """Раздел сводки: что из недельного плана сдвинулось."""
+    if not goals:
+        return ["## Недельный план", "",
+                "_В карточках «Планирование недели» ссылок на истории не нашлось. "
+                "Поставьте в плане ссылку на историю — тогда здесь будет видно, "
+                "как она движется через задачи в дейликах._"]
+    import datetime
+    _d = lambda s: datetime.datetime.fromisoformat(s.replace("Z","+00:00")) if s else None
+    mon_utc = monday.astimezone(datetime.timezone.utc)
+    L = ["## Недельный план", "",
+         f"Неделя с {monday:%d.%m}. Цели берутся из «Планирования недели», "
+         f"движение — из задач внутри них.", "",
+         "| Цель | Задач | Закрыто | В работе | Не начато | Названо в дейликах |",
+         "|---|---:|---:|---:|---:|---:|"]
+    detail = []
+    for g in goals:
+        it = week_story(g, cache)
+        if not it:
+            detail.append(("❓", f"{g[0]}/{g[1]}/{g[2]} — такой карточки нет", []))
+            continue
+        tks = week_tasks(it["slug"], it["ref"], cache) if it["kind"] == "us" else []
+        if not tks:
+            L.append(f"| {it['project']} #{it['ref']} · {cut(it['subject'], 34)} "
+                     f"| — | — | — | — | — |")
+            detail.append(("•", f"{it['project']} #{it['ref']} · {cut(it['subject'], 60)} · "
+                                f"{it['status']} — задач внутри нет", []))
+            continue
+        closed = [t for t in tks if t["closed"]]
+        prog = [t for t in tks if not t["closed"] and "progress" in t["status"].lower()]
+        rest = [t for t in tks if not t["closed"] and t not in prog]
+        named = [t for t in tks if t["ref"] in daily_refs.get(it["slug"], set())]
+        L.append(f"| {it['project']} #{it['ref']} · {cut(it['subject'], 34)} | {len(tks)} "
+                 f"| {len(closed)} | {len(prog)} | {len(rest)} | {len(named)} |")
+        # Закрытые на этой неделе, которых в дейликах не называли, — работа мимо плана.
+        quiet = [t for t in closed
+                 if t["modified"] and _d(t["modified"]) >= mon_utc
+                 and t["ref"] not in daily_refs.get(it["slug"], set())]
+        detail.append(("", f"{it['project']} #{it['ref']} · {cut(it['subject'], 60)}",
+                       [(t, t["ref"] in daily_refs.get(it["slug"], set()), t in quiet) for t in tks]))
+    for mark, head, tks in detail:
+        L += ["", f"**{mark} {head}**".replace("** ", "**")]
+        for t, named, quiet in tks:
+            m = "✅" if t["closed"] else ("▶" if "progress" in t["status"].lower() else "⏸")
+            tail = "" if named else ("  ← закрыта на этой неделе, в дейликах не называлась"
+                                     if quiet else "  ← в дейликах не называлась")
+            L.append(f"- {m} #{t['ref']} · {cut(t['subject'], 54)} · {t['status']}{tail}")
+    return L
+
+def week_tg(goals, daily_refs, cache):
+    """Строка для сообщения руководителю."""
+    if not goals: return []
+    tot = done = 0
+    for g in goals:
+        it = week_story(g, cache)
+        if not it or it["kind"] != "us": continue
+        tks = week_tasks(it["slug"], it["ref"], cache)
+        tot += len(tks); done += len([t for t in tks if t["closed"]])
+    if not tot: return []
+    return ["", f"\U0001F4C5 Недельный план: задач {tot}, закрыто {done} "
+                f"({done * 100 // tot}%)"]
+
 def cmd_standup(args):
     import datetime
     if args.install or args.uninstall: return standup_install(args)
@@ -1647,6 +1756,27 @@ def cmd_standup(args):
             L.append("")
     tqueue = test_queue(projects)          # обход дорогой, делаем один раз
     L += [""] + test_block(events, tqueue)
+    # Недельные цели и задачи, названные в дейликах этой недели.
+    monday = start_l - datetime.timedelta(days=start_l.weekday())
+    goals, daily_refs = [], {}
+    want_week = f"{monday:%d}.{monday:%m}.{monday:%Y}"
+    for o in (cards or []):
+        subj = (o.get("subject") or "").strip()
+        mw = WEEK_RE.match(subj)
+        md = CHECK_RE.match(subj)
+        if mw and f"{mw.group(1)}.{mw.group(2)}.{mw.group(3)}" == want_week:
+            c2, full = api("GET", f"/userstories/{o['id']}")
+            for g in week_links((full or {}).get("description") or ""):
+                if g not in goals: goals.append(g)
+        elif md:
+            dd = datetime.date(int(md.group(3)), int(md.group(2)), int(md.group(1)))
+            if not (monday.date() <= dd <= day): continue
+            c2, full = api("GET", f"/userstories/{o['id']}")
+            for p in standup_parse((full or {}).get("description") or ""):
+                for sl, k, r in p["links"]:
+                    daily_refs.setdefault(sl, set()).add(r)
+    L += [""] + week_block(goals, daily_refs, cache, monday, day)
+
     scards = support_cards(projects)
     snotes = support_notes(scards, start, end)
     L += [""] + support_block(snotes, scards)
@@ -1682,6 +1812,7 @@ def cmd_standup(args):
             r = tg_call("sendMessage", {"chat_id": tgt["chat_id"],
                                         "text": standup_tg(b, day) + "\n"
                                                 + "\n".join(test_tg(events, q, only))
+                                                + "\n".join(week_tg(goals, daily_refs, cache))
                                                 + "\n".join(support_tg(snotes)),
                                         "disable_web_page_preview": True})
             ok(f"  {b['pm']}: {'отправлено' if r.get('ok') else 'ОШИБКА ' + str(r.get('description'))}")
