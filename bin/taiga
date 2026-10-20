@@ -1674,10 +1674,18 @@ def cmd_standup(args):
     moved = {}                               # (slug, kind, ref) → переходы за день
     for e in events:
         moved.setdefault((str(e["slug"]).lower(), e["kind"], e["ref"]), []).append(e)
-    closed_by = {}                           # кто что закрыл за день
-    for e in events:
-        if e["to_closed"] and not e["from_closed"]:
-            closed_by.setdefault(e["who"], []).append(e)
+    # «Сверх плана» раньше считало только закрытия, и день, проведённый
+    # за передачей карточек на проверку, выглядел пустым. Берём значимые
+    # переходы: закрытие, отправка в тест, взятие в работу, возврат в баги.
+    # Перекладывание внутри бэклога работой не считаем.
+    moved_by = {}
+    for e in sorted(events, key=lambda x: x["at"]):
+        t = e["to"].lower()
+        if not ((e["to_closed"] and not e["from_closed"])
+                or "ready for test" in t or "progress" in t or "bug" in t):
+            continue
+        key = (str(e["slug"]).lower(), e["kind"], e["ref"])
+        moved_by.setdefault(e["who"], {})[key] = e       # одна карточка — один раз
 
     blocks = []
     for t in todays:
@@ -1704,8 +1712,9 @@ def cmd_standup(args):
                 items.append(it)
             extra = []
             if who:
-                for e in closed_by.get(who["display"], []):
-                    if (str(e["slug"]).lower(), e["kind"], e["ref"]) not in inplan: extra.append(e)
+                for key, e in moved_by.get(who["display"], {}).items():
+                    if key not in inplan: extra.append(e)
+                extra.sort(key=lambda x: x["at"])
             rows.append({"name": p["name"], "who": who, "items": items, "extra": extra,
                          "bare": p["bare"],
                          "body": p["body"],
