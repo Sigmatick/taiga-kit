@@ -1453,6 +1453,77 @@ def test_tg(events, queue, only=None):
         L.append("вернули: " + ", ".join(f"{x['project']} #{x['ref']}" for x in back[:5]))
     return L
 
+# ── операционка: общая карточка, в комментариях которой пишут инженеры ─────
+# Такая карточка выпадает из всех цифр: отчёты строятся на переходах
+# отдельных карточек, а здесь один переход на всех. Зато у комментария
+# есть автор и время — по ним и собираем.
+SUPPORT_TITLE = "техническое сопровождение"
+
+def support_cards(projects, title=None):
+    """Карточки операционки по названию. Дата в названии необязательна:
+    комментарии всё равно отбираются по дню, так что одна общая карточка
+    и карточка-на-день работают одинаково."""
+    want = (title or cfg_load().get("support_title", SUPPORT_TITLE)).strip().lower()
+    out = []
+    for p in (projects or []):
+        for kind, api_name in (("us", "userstory"), ("task", "task"), ("issue", "issue")):
+            c, objs = api("GET", f"/{KINDS[kind][0]}?project={p['id']}", nopage=True)
+            for o in (objs or []):
+                if want in (o.get("subject") or "").lower():
+                    out.append({"pr": p["name"], "slug": p["slug"], "kind": kind,
+                                "api": api_name, "id": o["id"], "ref": o["ref"],
+                                "subj": o["subject"]})
+    return out
+
+def support_notes(cards, d_from, d_to):
+    """Комментарии за день, сгруппированные по автору."""
+    import datetime
+    _d = lambda s: datetime.datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
+    rows = []
+    for cd in cards:
+        c, h = api("GET", f"/history/{cd['api']}/{cd['id']}")
+        for e in (h or []):
+            txt = (e.get("comment") or "").strip()
+            if not txt: continue
+            tm = _d(e.get("created_at"))
+            if not (tm and d_from <= tm < d_to): continue
+            rows.append({"pr": cd["pr"], "ref": cd["ref"],
+                         "who": (e.get("user") or {}).get("name") or "?",
+                         "at": e["created_at"], "text": " ".join(txt.split())})
+    rows.sort(key=lambda x: x["at"])
+    return rows
+
+def support_block(rows, cards):
+    """Раздел для файла сводки."""
+    if not cards:
+        return ["## Операционка за день", "",
+                "_Карточек «Техническое сопровождение» не нашлось. Руководитель "
+                "заводит их сам; пока их нет, этот раздел пуст._"]
+    L = ["## Операционка за день", ""]
+    if not rows:
+        L.append(f"Карточек найдено: {len(cards)}, записей за день нет.")
+        return L
+    by = {}
+    for r in rows: by.setdefault(r["who"], []).append(r)
+    L += [f"Записей: {len(rows)} · человек: {len(by)}", "",
+          "| Человек | Записей |", "|---|---:|"]
+    for w, rs in sorted(by.items(), key=lambda kv: -len(kv[1])):
+        L.append(f"| {w} | {len(rs)} |")
+    for w, rs in sorted(by.items(), key=lambda kv: -len(kv[1])):
+        L += ["", f"**{w}**"]
+        for r in rs:
+            L.append(f"- {r['at'][11:16]} · {r['pr']} #{r['ref']} · {cut(r['text'], 150)}")
+    return L
+
+def support_tg(rows):
+    """Одной строкой в сообщение руководителю."""
+    if not rows: return []
+    by = {}
+    for r in rows: by.setdefault(r["who"], []).append(r)
+    top = ", ".join(f"{w} {len(rs)}" for w, rs in
+                    sorted(by.items(), key=lambda kv: -len(kv[1]))[:5])
+    return ["", f"\U0001F527 Операционка: записей {len(rows)} · {top}"]
+
 def cmd_standup(args):
     import datetime
     if args.install or args.uninstall: return standup_install(args)
@@ -1576,6 +1647,9 @@ def cmd_standup(args):
             L.append("")
     tqueue = test_queue(projects)          # обход дорогой, делаем один раз
     L += [""] + test_block(events, tqueue)
+    scards = support_cards(projects)
+    snotes = support_notes(scards, start, end)
+    L += [""] + support_block(snotes, scards)
     rd = reports_dir(); rd.mkdir(parents=True, exist_ok=True)
     out = rd / f"План-факт_{day:%Y-%m-%d}.md"
     out.write_text("\n".join(L) + "\n")
@@ -1607,7 +1681,8 @@ def cmd_standup(args):
                 only = {slug2name.get(x, x) for x in (sb.get("projects") or [])}
             r = tg_call("sendMessage", {"chat_id": tgt["chat_id"],
                                         "text": standup_tg(b, day) + "\n"
-                                                + "\n".join(test_tg(events, q, only)),
+                                                + "\n".join(test_tg(events, q, only))
+                                                + "\n".join(support_tg(snotes)),
                                         "disable_web_page_preview": True})
             ok(f"  {b['pm']}: {'отправлено' if r.get('ok') else 'ОШИБКА ' + str(r.get('description'))}")
     return out
