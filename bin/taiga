@@ -2224,7 +2224,12 @@ def tg_serve(args):
             TG_BEAT.touch()
             n, err = tg_poll(long=True)
             if err:
-                print(f"telegram: {err}", file=sys.stderr); time.sleep(5)
+                if "Conflict" in str(err):
+                    print("telegram: кто-то ещё опрашивает бота — обновления "
+                          "теряются. Остановите второй процесс", file=sys.stderr)
+                    time.sleep(15)
+                else:
+                    print(f"telegram: {err}", file=sys.stderr); time.sleep(5)
         except KeyboardInterrupt:
             ok("остановлен"); return
         except Exception as e:
@@ -2368,14 +2373,23 @@ def cmd_telegram(args):
     if args.install or args.uninstall: return tgpoll_install(args)
     if args.serve: return tg_serve(args)
     if args.poll:
+        if tg_busy():
+            ok("слушатель бота уже читает — разовый опрос не нужен"); return
         auth()
         n, err = tg_poll()
         if err: die(f"Telegram: {err}")
         if n: ok(f"новых подписок: {n}")
         return
     if args.discover:
-        n, err = tg_poll()
-        if err: die(f"Telegram: {err}")
+        # Telegram разрешает один getUpdates на бота: второй рвёт первый
+        # и обновления теряются. Слушатель жив — просто показываем, что он
+        # уже записал, не лезем в сеть.
+        n = 0
+        if tg_busy():
+            ok("слушатель бота работает — показываю, что он записал\n")
+        else:
+            n, err = tg_poll()
+            if err: die(f"Telegram: {err}")
         seen = cfg_load().get("telegram_seen", {})
         rec = cfg_load().get("telegram_recipients", {})
         linked = {str(v["chat_id"]) for v in rec.values()}
