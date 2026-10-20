@@ -2713,7 +2713,10 @@ def digest_data(uid, need_closed=False):
     d_from, d_to = today.astimezone(datetime.timezone.utc), now
     _d = lambda s: datetime.datetime.fromisoformat(s.replace("Z","+00:00")) if s else None
 
-    mine, stuck, closed_y, fresh = [], [], [], []
+    # Раньше собирались только закрытия, и день, в который человек передал
+    # девять карточек на проверку, выглядел пустым. Собираем ВСЕ переходы:
+    # передача в тест — такой же результат, как закрытие.
+    mine, stuck, closed_y, fresh, moves = [], [], [], [], []
     c, projects = api("GET", "/projects")
     for p in (projects or []):
         pid, pname = p["id"], p["name"]
@@ -2747,22 +2750,42 @@ def digest_data(uid, need_closed=False):
                         # Раньше годился любой: достаточно было тронуть карточку,
                         # которую закрыл кто-то другой.
                         was, now_st = vd["status"][0], vd["status"][1]
+                        mv = dict(rec, **{"from": was, "to": now_st, "at": e["created_at"]})
+                        moves.append(mv)
                         if closed_by_name.get(str(now_st).strip().lower()) and \
                            not closed_by_name.get(str(was).strip().lower()):
-                            closed_y.append(rec); break
+                            closed_y.append(rec)
+    moves.sort(key=lambda x: x["at"])
     return {"mine": mine, "stuck": stuck, "closed": closed_y, "fresh": fresh,
-            "period": f"{prev:%d.%m}", "day": f"{today:%d.%m}"}
+            "moves": moves, "period": f"{prev:%d.%m}", "day": f"{today:%d.%m}"}
 
 def digest_text(name, d, kind):
     import datetime
     L = [f"Taiga · {name} · {datetime.datetime.now().astimezone():%a %d.%m}", ""]
     if kind == "evening":
+        mv = d.get("moves") or []
+        def bucket(x):
+            t = x["to"].lower()
+            if "ready for test" in t: return ("\U0001F9EA", "передали на проверку")
+            if "progress" in t:       return ("\u25B6", "взяли в работу")
+            if "bug" in t:            return ("\U0001F41E", "вернули в баги")
+            return ("\u2022", "перевели")
+        done = {(r["pr"], r["ref"]) for r in d["closed"]}
+        groups = {}
+        for x in mv:
+            if (x["pr"], x["ref"]) in done: continue
+            groups.setdefault(bucket(x), []).append(x)
         if d["closed"]:
-            L.append(f"Закрыли {d.get('day','сегодня')}: {len(d['closed'])}")
+            L.append(f"\u2705 Закрыли {d.get('day','сегодня')}: {len(d['closed'])}")
             for r in d["closed"][:6]:
-                L.append(f"  \u2705 {r['pr']} #{r['ref']} · {cut(r['subj'], 70)}")
-        else:
-            L.append(f"За {d.get('day','сегодня')} ничего не закрыто.")
+                L.append(f"  {r['pr']} #{r['ref']} · {cut(r['subj'], 70)}")
+        for (ic, name), rows in groups.items():
+            L.append(f"{ic} {name.capitalize()}: {len(rows)}")
+            for x in rows[:6]:
+                L.append(f"  {x['pr']} #{x['ref']} · {cut(x['subj'], 66)}")
+            if len(rows) > 6: L.append(f"  …и ещё {len(rows)-6}")
+        if not d["closed"] and not groups:
+            L.append(f"За {d.get('day','сегодня')} карточки не двигались.")
         inwork = [r for r in d["mine"] if "progress" in r["st"].lower()]
         if inwork:
             L.append("")
