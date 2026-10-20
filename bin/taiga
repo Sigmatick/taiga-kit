@@ -1902,6 +1902,7 @@ TG_HELP = (
     "проекты domcom, checkpoint — следить за этими проектами\n"
     "проекты все — за всеми\n"
     "проекты — показать, за чем слежу сейчас\n"
+    "я — связать чат со своей учётной записью Taiga\n"
     "сразу / вечером — переключить режим\n"
     "стоп — отписаться\n"
     "проекты? — выбрать кнопками\n\n"
@@ -1924,6 +1925,8 @@ def tg_cmd(cid, text, slugs, names):
 
     if low in ("помощь", "help", "start", "старт", "?"): return TG_HELP
 
+    if low in ("я", "связать", "кто я", "link"):
+        return "__WHOAMI__"
     if low in ("проекты?", "проекты ?", "список", "projects?", "выбрать", "режим"):
         return "__BOARD__"
     if low in ("сразу", "вечером"):
@@ -2107,6 +2110,105 @@ def tg_busy():
     try: return time.time() - TG_BEAT.stat().st_mtime < 180
     except Exception: return False
 
+# ── привязка чата к учётной записи: человек выбирает, админ подтверждает ───
+# Автоматом по имени нельзя: «Mikhail S.» и «Михаил Степанов» не совпадут,
+# а совпадающее имя в Telegram может взять кто угодно — и начнёт получать
+# чужие задачи. Поэтому выбор за человеком, решение за администратором.
+def admin_chat():
+    """Кому слать запросы на подтверждение: чат владельца кита."""
+    cfg = cfg_load()
+    v = cfg.get("admin_chat")
+    if v: return int(v)
+    rec = cfg.get("telegram_recipients", {})
+    me = rec.get(str((IDENTITY or {}).get("id")))
+    return int(me["chat_id"]) if me else None
+
+def link_people():
+    c, users = api("GET", "/users")
+    return sorted([u for u in (users or []) if u.get("is_active", True)],
+                  key=lambda u: (u.get("full_name_display") or u.get("username") or ""))
+
+def link_board(cid, people):
+    """Список сотрудников кнопками. Имя в Telegram неважно: человек
+    указывает себя сам, поэтому сокращения и латиница не мешают."""
+    rec = cfg_load().get("telegram_recipients", {})
+    mine = next((v for v in rec.values() if int(v["chat_id"]) == int(cid)), None)
+    if mine:
+        return (f"Вы уже связаны с учётной записью «{mine['name']}».\n"
+                "Ошибка? Напишите администратору."), None
+    pend = cfg_load().get("link_pending", {}).get(str(cid))
+    if pend:
+        return (f"Заявка отправлена: «{pend['name']}». Ждём подтверждения "
+                "администратора."), None
+    rows, row = [], []
+    for u in people:
+        nm = u.get("full_name_display") or u.get("username")
+        row.append({"text": nm[:28], "callback_data": f"l:{u['id']}"})
+        if len(row) == 2: rows.append(row); row = []
+    if row: rows.append(row)
+    return ("Найдите себя в списке — это свяжет чат с вашей учётной записью "
+            "Taiga.\nАдминистратор подтвердит, и уведомления начнут приходить."), \
+           {"inline_keyboard": rows}
+
+def link_pick(q, people):
+    """Человек выбрал себя. Ставим заявку и спрашиваем администратора."""
+    msg = q.get("message") or {}
+    cid = (msg.get("chat") or {}).get("id"); mid = msg.get("message_id")
+    uid = (q.get("data") or "")[2:]
+    u = next((x for x in people if str(x["id"]) == uid), None)
+    if not (cid and u): return
+    name = u.get("full_name_display") or u.get("username")
+    c = msg.get("chat") or {}
+    who = (" ".join(x for x in (c.get("first_name"), c.get("last_name")) if x)
+           or c.get("username") or str(cid))
+    pend = cfg_load().get("link_pending", {})
+    pend[str(cid)] = {"uid": u["id"], "name": name, "who": who}
+    cfg_set("link_pending", pend)
+    tg_call("answerCallbackQuery", {"callback_query_id": q["id"], "text": "Заявка отправлена"})
+    tg_call("editMessageText", {"chat_id": cid, "message_id": mid,
+        "text": f"Заявка отправлена: «{name}».\nКак администратор подтвердит, "
+                "уведомления начнут приходить."})
+    a = admin_chat()
+    if a:
+        tg_call("sendMessage", {"chat_id": a,
+            "text": f"Запрос на привязку\n\n«{who}» в Telegram называет себя: {name}\n"
+                    f"Связать?",
+            "reply_markup": {"inline_keyboard": [[
+                {"text": "✅ Да", "callback_data": f"ly:{cid}"},
+                {"text": "⬜ Нет", "callback_data": f"ln:{cid}"}]]}})
+    else:
+        ok(f"  заявка от {who} на «{name}», но чат администратора не задан")
+
+def link_decide(q):
+    """Администратор нажал Да или Нет."""
+    data = q.get("data") or ""
+    yes = data.startswith("ly:")
+    cid = data.split(":", 1)[1]
+    msg = q.get("message") or {}
+    pend = cfg_load().get("link_pending", {})
+    p = pend.pop(cid, None)
+    cfg_set("link_pending", pend)
+    if not p:
+        tg_call("answerCallbackQuery", {"callback_query_id": q["id"],
+                                        "text": "Заявки уже нет"})
+        return
+    if yes:
+        rec = cfg_load().get("telegram_recipients", {})
+        rec[str(p["uid"])] = {"chat_id": int(cid), "name": p["name"]}
+        cfg_set("telegram_recipients", rec)
+        tg_call("sendMessage", {"chat_id": int(cid),
+            "text": f"Готово: вы связаны с учётной записью «{p['name']}».\n"
+                    "Уведомления начнут приходить. «помощь» — что умею."})
+        note = f"Связал: «{p['who']}» → {p['name']}"
+    else:
+        tg_call("sendMessage", {"chat_id": int(cid),
+            "text": "Администратор не подтвердил привязку. "
+                    "Напишите ему напрямую, если это ошибка."})
+        note = f"Отклонено: «{p['who']}» → {p['name']}"
+    tg_call("answerCallbackQuery", {"callback_query_id": q["id"], "text": note[:180]})
+    tg_call("editMessageText", {"chat_id": (msg.get("chat") or {}).get("id"),
+                                "message_id": msg.get("message_id"), "text": note})
+
 def tg_serve(args):
     """Длинный опрос. Нажатие кнопки Telegram живёт считанные секунды:
     разобранное через две минуты уже просрочено, и у человека вечно висит
@@ -2149,7 +2251,10 @@ def tg_poll(quiet=True, long=False):
     for u in ups:
         last = max(last or 0, u.get("update_id", 0))
         if u.get("callback_query"):
-            if slugs: tg_tap(u["callback_query"], slugs, names)
+            q = u["callback_query"]; dt = q.get("data") or ""
+            if dt.startswith(("ly:", "ln:")): link_decide(q)
+            elif dt.startswith("l:"): link_pick(q, link_people())
+            elif slugs: tg_tap(q, slugs, names)
             continue
         m = u.get("message") or u.get("edited_message") or {}
         c = m.get("chat") or {}
@@ -2166,6 +2271,11 @@ def tg_poll(quiet=True, long=False):
             if ans == "__BOARD__":
                 head, kb = tg_board(cid, slugs, names)
                 tg_call("sendMessage", {"chat_id": cid, "text": head, "reply_markup": kb})
+                ans = None
+            elif ans == "__WHOAMI__":
+                head, kb = link_board(cid, link_people())
+                tg_call("sendMessage", {"chat_id": cid, "text": head,
+                                        **({"reply_markup": kb} if kb else {})})
                 ans = None
             if ans:
                 sb = subs_load()
@@ -2191,8 +2301,8 @@ def tg_poll(quiet=True, long=False):
             "кнопками, отметите свои, и карточки начнут приходить сразу "
             "по мере поступления на проверку.\n\n"
             "«помощь» — все команды.\n\n"
-            "Для остального администратор должен связать ваш чат с учётной "
-            "записью Taiga — напишите ему, что подписались."})
+            "Чтобы получать СВОИ задачи, напишите «я» — покажу список "
+            "сотрудников, выберите себя. Администратор подтвердит."})
     if new: cfg_set("telegram_seen", known)
     # Смещение двигаем ПОСЛЕДНИМ: сорвались раньше — сообщения придут снова
     # и команды применятся повторно, что безопасно. Наоборот было бы потерей.
