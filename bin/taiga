@@ -2385,12 +2385,39 @@ def digest_text(name, d, kind):
             for r in sorted(inwork, key=lambda x: -x["age"])[:5]:
                 L.append(f"  \u25B6 {r['pr']} #{r['ref']} · {r['age']}д · {cut(r['subj'], 66)}")
         return "\n".join(L)
-    # утро
-    L.append(f"На вас открыто: {len(d['mine'])}")
-    for r in sorted(d["mine"], key=lambda x: -x["age"])[:6]:
-        L.append(f"  {st_icon(r['st'])} {r['pr']} #{r['ref']} · {r['st']} · {r['age']}д · "
-                 f"{cut(r['subj'], 60)}")
-    if len(d["mine"]) > 6: L.append(f"  …и ещё {len(d['mine'])-6}")
+    # Утро. Сортировка по возрасту показывала самое старое и самое
+    # бесполезное: сверху висел бэклог, заведённый полтора месяца назад,
+    # а живые задачи прятались за «и ещё 23». Делим по тому, требует
+    # ли карточка действия ИМЕННО сейчас, и называем числа по кучкам —
+    # иначе «открыто 29» пугает, хотя делать не надо ничего.
+    buckets = [("в работе", ("progress",), "▶"),
+               ("ждут вас", ("bug", "todo", "to do", "needs info"), "🐞"),
+               ("на проверке", ("ready for test", "ready to test"), "🧪"),
+               ("в бэклоге", (), "•")]
+    def bucket(r):
+        t = r["st"].lower()
+        for i, (_, keys, _ic) in enumerate(buckets):
+            if keys and any(k in t for k in keys): return i
+        return len(buckets) - 1
+    groups = {}
+    for r in d["mine"]: groups.setdefault(bucket(r), []).append(r)
+    head = ", ".join(f"{buckets[i][0]} {len(groups[i])}" for i in sorted(groups))
+    L.append(f"На вас открыто: {len(d['mine'])} — {head}")
+    act = sorted(groups.get(0, []) + groups.get(1, []), key=lambda x: -x["age"])
+    if act:
+        L.append("")
+        for r in act[:6]:
+            L.append(f"  {st_icon(r['st'])} {r['pr']} #{r['ref']} · {r['st']} · {r['age']}д · "
+                     f"{cut(r['subj'], 60)}")
+        if len(act) > 6: L.append(f"  …и ещё {len(act)-6}")
+    else:
+        L.append("Ничего не ждёт вашего хода: в работе и к работе — пусто.")
+    wait = groups.get(2, [])
+    if wait:
+        L += ["", f"🧪 Ждут тестировщика: {len(wait)} — ваш ход не нужен"]
+        for r in sorted(wait, key=lambda x: -x["age"])[:3]:
+            L.append(f"  {r['pr']} #{r['ref']} · {r['age']}д · {cut(r['subj'], 56)}")
+        if len(wait) > 3: L.append(f"  …и ещё {len(wait)-3}")
     if d["stuck"]:
         L += ["", f"Зависло в работе ≥7 дней: {len(d['stuck'])}"]
         for r in sorted(d["stuck"], key=lambda x: -x["age"])[:4]:
