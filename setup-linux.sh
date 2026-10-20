@@ -133,20 +133,33 @@ echo "     .../project/egsv/us/159              -> egsv"
 echo "     .../project/digital-police/task/294  -> digital-police"
 echo "  Дефис входит в слаг. Слаг не равен названию: проект могли переименовать."
 echo
-read -r -p "  слаг проекта (пусто — пропустить): " SLUG
-if [ -n "$SLUG" ]; then
+# Проектов обычно несколько, и у каждого СВОЯ папка с кодом: привязка
+# лежит в ней, а не в общем списке. Поэтому не строка слагов, а цикл.
+echo "  Подключать можно сколько угодно: после каждого спрошу, нужен ли ещё."
+echo
+DONE_N=0; LAST_DIR=""
+while :; do
+  read -r -p "  слаг проекта (пусто — закончить): " SLUG
+  [ -n "$SLUG" ] || break
   DEF="$HOME/$SLUG"
   read -r -p "  папка проекта [$DEF]: " DIR
   DIR="${DIR:-$DEF}"
   DIR="${DIR/#\~/$HOME}"
-  mkdir -p "$DIR" || fail "не удалось создать $DIR"
-  ( cd "$DIR" && "$BIN/taiga" init "$SLUG" ) || fail "подключение не удалось"
+  if ! mkdir -p "$DIR"; then warn "  не удалось создать $DIR — пропускаю"; continue; fi
+  if ( cd "$DIR" && "$BIN/taiga" init "$SLUG" ); then
+    DONE_N=$((DONE_N+1)); LAST_DIR="$DIR"
+    ( cd "$DIR" && "$BIN/taiga" ls --open 2>/dev/null | head -4 )
+  else
+    warn "  «$SLUG» подключить не удалось — проверьте слаг и права"
+  fi
   echo
-  ( cd "$DIR" && "$BIN/taiga" ls --open 2>/dev/null | head -6 )
-  bold "Готово"
+done
+
+if [ "$DONE_N" -gt 0 ]; then
+  bold "Готово: подключено проектов — $DONE_N"
   cat <<TXT
-  Откройте Claude Code с папкой:
-     $DIR
+  Откройте Claude Code с папкой проекта, например:
+     $LAST_DIR
   и напишите: что в бэклоге
 
   ЭТО УСТАНАВЛИВАЕТСЯ ОДИН РАЗ НА КОМПЬЮТЕР.
@@ -156,7 +169,7 @@ if [ -n "$SLUG" ]; then
 TXT
 else
   bold "Готово"
-  echo "  Проект подключите позже: откройте Claude Code с его папкой"
+  echo "  Проекты подключите позже: откройте Claude Code с папкой проекта"
   echo "  и напишите:  подключи эту папку к проекту <слаг>"
   echo "  Переустанавливать кит для этого НЕ НУЖНО."
 fi

@@ -208,21 +208,34 @@ Write-Host '     .../project/egsv/us/159              -> egsv'
 Write-Host '     .../project/digital-police/task/294  -> digital-police'
 Write-Host '  Дефис входит в слаг. Слаг не равен названию: проект могли переименовать.'
 Write-Host ''
-$slug = Read-Host '  слаг проекта (пусто — пропустить)'
-
-if ($slug) {
+# Проектов обычно несколько, и у каждого СВОЯ папка с кодом: привязка
+# лежит в ней, а не в общем списке. Поэтому не строка слагов, а цикл.
+Write-Host '  Подключать можно сколько угодно: после каждого спрошу, нужен ли ещё.'
+Write-Host ''
+$doneN = 0; $lastDir = ''
+while ($true) {
+    $slug = Read-Host '  слаг проекта (пусто — закончить)'
+    if (-not $slug) { break }
     $def = Join-Path $env:USERPROFILE "Documents\$slug"
     $dir = Read-Host "  папка проекта [$def]"
     if (-not $dir) { $dir = $def }
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    try { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    catch { Warn "  не удалось создать $dir — пропускаю"; continue }
     Push-Location $dir
     & "$bin\taiga.cmd" init $slug
-    if ($LASTEXITCODE -ne 0) { Pop-Location; Fail 'подключение не удалось' }
-    Write-Host ''
-    & "$bin\taiga.cmd" ls --open | Select-Object -First 6
+    if ($LASTEXITCODE -eq 0) {
+        $doneN++; $lastDir = $dir
+        & "$bin\taiga.cmd" ls --open | Select-Object -First 4
+    } else {
+        Warn "  «$slug» подключить не удалось — проверьте слаг и права"
+    }
     Pop-Location
-    Bold 'Готово'
-    Write-Host "  Откройте Claude Code с папкой:`n     $dir`n  и напишите: что в бэклоге"
+    Write-Host ''
+}
+
+if ($doneN -gt 0) {
+    Bold "Готово: подключено проектов — $doneN"
+    Write-Host "  Откройте Claude Code с папкой проекта, например:`n     $lastDir`n  и напишите: что в бэклоге"
     Write-Host ''
     Write-Host '  ЭТО УСТАНАВЛИВАЕТСЯ ОДИН РАЗ НА КОМПЬЮТЕР.' -ForegroundColor Yellow
     Write-Host '  Для следующего проекта распаковывать архив заново НЕ НУЖНО:'
@@ -230,7 +243,7 @@ if ($slug) {
     Write-Host '     подключи эту папку к проекту <слаг>'
 } else {
     Bold 'Готово'
-    Write-Host '  Проект подключите позже: откройте Claude Code с его папкой'
+    Write-Host '  Проекты подключите позже: откройте Claude Code с папкой проекта'
     Write-Host '  и напишите:  подключи эту папку к проекту <слаг>'
     Write-Host '  Переустанавливать кит для этого НЕ НУЖНО.' -ForegroundColor Yellow
 }
