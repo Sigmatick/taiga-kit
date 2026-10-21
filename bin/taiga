@@ -1348,9 +1348,34 @@ def standup_people(users_raw):
     return [{"id": u["id"], "display": u.get("full_name_display") or u.get("username") or "",
              "username": (u.get("username") or "")} for u in (users_raw or [])]
 
+# ── карта команды ──────────────────────────────────────────────────────────
+# В карточках людей зовут сокращённо: «Валера», «Володя», «Наташа». Разбор
+# дейликов их не находил и молча пропускал целые блоки. Карта лежит в конфиге
+# (ключ `roster`), чтобы правилась без правки программы.
+def roster():
+    return cfg_load().get("roster") or {}
+
+def roster_alias(name):
+    """Прозвище → имя в Taiga. Ничего не нашли — возвращаем как было."""
+    n = " ".join((name or "").split()).strip().lower()
+    if not n: return name
+    for full, info in roster().items():
+        if n == full.lower(): return full
+        for a in (info.get("aliases") or []):
+            if n == a.lower(): return full
+    return name
+
+def roster_projects(name):
+    """Слаги проектов человека. Пусто — значит не знаем, фильтровать нечем."""
+    info = roster().get(roster_alias(name)) or {}
+    return list(info.get("projects") or [])
+
+def roster_role(name):
+    return (roster().get(roster_alias(name)) or {}).get("role") or ""
+
 def standup_match(name, people):
     """Имя из карточки → человек в Taiga. Неуверенно — лучше никак."""
-    n = name.strip().lower()
+    n = roster_alias(name).strip().lower()      # «Валера» → «Жиганов Валерий»
     if not n: return None
     for p in people:
         if p["display"].lower() == n or p["username"].lower() == n: return p
