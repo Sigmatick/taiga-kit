@@ -913,7 +913,15 @@ SECRET_RE = re.compile(r"(?i)(пароль|password|passwd|token|токен|api[
                        r"\s*[:=]\s*\S{4,}")
 STEP_RE = re.compile(r"^\s*1\s*[.)]\s*\S", re.M)
 
-def triage_bug(subj, desc, full):
+def has_attachments(kind, pid, oid):
+    """Ловушка Taiga: поле attachments на самом объекте ВСЕГДА пустое,
+    и по by_ref, и по детальному вызову. Вложения отдаёт только отдельный
+    запрос. На этом я один раз уже обжёгся: отчёт утверждал, что вложений
+    нет у 52 багов из 53, тогда как на деле они были у 35 из 39."""
+    c, att = api("GET", f"/{KINDS[kind][0]}/attachments?object_id={oid}&project={pid}")
+    return bool(att)
+
+def triage_bug(subj, desc, full, att=None):
     """Замечания к баг-репорту по стандарту. Только для карточек в BUG.
 
     Вложений нет у 52 багов из 53 — проверено на живых данных. Такое
@@ -938,11 +946,13 @@ def triage_bug(subj, desc, full):
         flags.append("не указана severity — ни в тегах, ни в описании")
     if not (any(x in tags for x in TEAMS) or "команда" in low):
         flags.append("не указана команда — ни в тегах, ни в описании")
+    if att is False:
+        flags.append("нет вложений: ни скринов, ни видео, ни MD-разбора")
     if SECRET_RE.search(desc):
         flags.append("⚠ в описании похоже на пароль или токен — убрать немедленно")
     return flags
 
-def triage_item(o, full, kids_desc, closed_ids):
+def triage_item(o, full, kids_desc, closed_ids, att=None):
     """Список замечаний к единице работы. Пусто — вопросов нет."""
     flags = []
     subj = (o.get("subject") or "").strip()
@@ -956,7 +966,7 @@ def triage_item(o, full, kids_desc, closed_ids):
         flags.append("не назначена ни на кого")
     st = (o.get("status_extra_info") or {}).get("name", "").lower()
     if "bug" in st:
-        if has_text: flags += triage_bug(subj, desc, full)
+        if has_text: flags += triage_bug(subj, desc, full, att)
         else: flags.append("баг без описания — по стандарту нужны шаги, окружение и роль")
     return flags
 
@@ -1000,16 +1010,17 @@ def _triage_one(args):
                 for k in kids.get(o["id"], []):
                     c, kf = api("GET", f"/tasks/{k['id']}")
                     if len((kf.get("description") or "").strip()) >= 80: kd = True; break
-            fl = triage_item(o, full, kd, closed_ids)
             st_name = (o.get("status_extra_info") or {}).get("name", "").lower()
+            att = has_attachments(kind, pid, o["id"]) if "bug" in st_name else None
+            fl = triage_item(o, full, kd, closed_ids, att)
             if "bug" in st_name:
                 bugs += 1
-                if not (full.get("attachments") or []): noatt += 1
+                if att is False: noatt += 1
             if fl: rows.append((kind, o, fl))
 
     ok(f"{p['name']}: новых за {args.days} дн — {total}, с замечаниями — {len(rows)}")
-    if noatt:
-        ok(f"  без вложений (скрины, видео, MD-разбор): {noatt} багов из {bugs}")
+    if bugs:
+        ok(f"  со вложениями: {bugs - noatt} багов из {bugs}")
     if not rows:
         ok("всё оформлено достаточно для работы"); return
     for kind, o, fl in sorted(rows, key=lambda x: -x[1]["ref"]):
@@ -4011,7 +4022,9 @@ def cmd_watch(args):
                 c, full = api("GET", f"/{KINDS[kind][0]}/{o['id']}")
                 kd = any(len(((api("GET", f"/tasks/{k['id']}")[1] or {}).get("description") or "").strip()) >= 80
                          for k in kids.get(o["id"], [])) if kind == "us" else False
-                flags = triage_item(o, full, kd, closed_ids)
+                st_nm = (o.get("status_extra_info") or {}).get("name", "").lower()
+                flags = triage_item(o, full, kd, closed_ids,
+                                    has_attachments(kind, pid, o["id"]) if "bug" in st_nm else None)
                 fn = tri / f"{o['ref']}-{_slugify(o['subject'])}.md"
                 made.append((o["ref"], o["subject"], fn, stub_text(slug, p["name"], kind, o, full, flags, base())))
 
