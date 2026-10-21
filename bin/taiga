@@ -1758,6 +1758,253 @@ def week_tg(goals, daily_refs, cache):
     return ["", f"\U0001F4C5 Недельный план: задач {tot}, закрыто {done} "
                 f"({done * 100 // tot}%)"]
 
+# ── опись открытого: что есть сейчас и чем отличается от вчера ─────────────
+# Снимок нужен для сравнения: без вчерашнего списка «новые» и «ушли»
+# посчитать не из чего, журнал переходов этого не даёт.
+SNAP_DIR = HOME / ".taiga-kit" / "снимки"
+
+def inv_bucket(name):
+    """Колонку приводим к понятной кучке. Названия у проектов разные,
+    поэтому по смыслу, а не по точному совпадению."""
+    t = (name or "").lower()
+    if "progress" in t or "работе" in t:            return "В процессе"
+    if "ready for test" in t or "ready to test" in t: return "Можно проверять"
+    if "bug" in t:                                   return "Баги"
+    if "todo" in t or "to do" in t:                  return "ToDo"
+    if "new" in t or "нов" in t:                     return "Новая"
+    if "needs info" in t:                            return "Нужны сведения"
+    return "Бэклог"
+
+INV_ORDER = ["Баги", "В процессе", "Можно проверять", "ToDo", "Новая",
+             "Нужны сведения", "Бэклог"]
+
+def inv_collect(projects):
+    """Все открытые единицы работы с тем, что о них нужно знать."""
+    rows = []
+    for p in (projects or []):
+        pid = p["id"]
+        for kind, ep in (("us", "userstory-statuses"), ("task", "task-statuses"),
+                         ("issue", "issue-statuses")):
+            c, st = api("GET", f"/{ep}?project={pid}")
+            cat = {x["id"]: (x["name"], x.get("is_closed", False)) for x in (st or [])}
+            c, objs = api("GET", f"/{KINDS[kind][0]}?project={pid}", nopage=True)
+            for o in (objs or []):
+                nm, closed = cat.get(o["status"], ("?", False))
+                if closed: continue
+                par = (o.get("user_story_extra_info") or {}).get("ref")
+                rows.append({
+                    "pr": p["name"], "slug": p["slug"], "kind": kind, "ref": o["ref"],
+                    "subj": o.get("subject") or "", "status": nm, "bucket": inv_bucket(nm),
+                    "sprint": o.get("milestone_name") or o.get("milestone_slug") or "",
+                    "parent": par, "due": o.get("due_date"),
+                    "blocked": bool(o.get("is_blocked")),
+                    "who": (o.get("assigned_to_extra_info") or {}).get("full_name_display") or "",
+                })
+    rows.sort(key=lambda x: (x["pr"], INV_ORDER.index(x["bucket"]) if x["bucket"] in INV_ORDER else 9, -x["ref"]))
+    return rows
+
+def inv_snap_save(day, rows):
+    SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    f = SNAP_DIR / f"{day}.json"
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rows, ensure_ascii=False)); tmp.replace(f)
+    return f
+
+def inv_snap_prev(day):
+    """Предыдущий снимок — последний по дате СТРОГО раньше сегодняшнего.
+    Не «вчера»: в понедельник сравнивать надо с пятницей, а после отпуска —
+    с тем, что было, а не с пустотой."""
+    if not SNAP_DIR.is_dir(): return None, None
+    got = sorted(x.stem for x in SNAP_DIR.glob("*.json") if x.stem < day)
+    if not got: return None, None
+    try: return got[-1], json.loads((SNAP_DIR / f"{got[-1]}.json").read_text())
+    except Exception: return None, None
+
+def inv_diff(now_rows, old_rows):
+    key = lambda r: (r["slug"], r["kind"], r["ref"])
+    now = {key(r): r for r in now_rows}
+    old = {key(r): r for r in (old_rows or [])}
+    new = [now[k] for k in now if k not in old]
+    gone = [old[k] for k in old if k not in now]
+    moved = [(old[k], now[k]) for k in now
+             if k in old and old[k]["bucket"] != now[k]["bucket"]]
+    return new, gone, moved
+
+def inv_attention(rows, today):
+    import datetime
+    tom = (datetime.date.fromisoformat(today) + datetime.timedelta(days=1)).isoformat()
+    over = [r for r in rows if r["due"] and r["due"] < today]
+    soon = [r for r in rows if r["due"] and today <= r["due"] <= tom]
+    blocked = [r for r in rows if r["blocked"]]
+    return over, soon, blocked
+
+def inv_line(r, base_url):
+    """Строка карточки: номер ссылкой, родитель и спринт — если есть."""
+    u = f"{base_url}/project/{r['slug']}/{WEB_PATH[r['kind']]}/{r['ref']}"
+    s = f"[#{r['ref']}]({u}) {cut(r['subj'], 90)}"
+    tail = []
+    if r["parent"]: tail.append(f"US #{r['parent']}")
+    if r["sprint"]: tail.append(f"спринт {r['sprint']}")
+    if r["who"]: tail.append(r["who"])
+    if r["due"]: tail.append(f"срок {r['due']}")
+    if r["blocked"]: tail.append("ЗАБЛОКИРОВАНА")
+    return s + (" · " + ", ".join(tail) if tail else "")
+
+def inv_report(rows, prev_day, prev_rows, today, base_url, full_backlog=False):
+    import datetime, collections
+    kinds = collections.Counter(r["kind"] for r in rows)
+    L = [f"# Taiga — {datetime.date.fromisoformat(today):%d.%m.%Y}", "",
+         f"Всего открыто **{len(rows)}**: {kinds['us']} историй, {kinds['task']} задач, "
+         f"{kinds['issue']} вопросов. Выгрузка {datetime.datetime.now().astimezone():%H:%M}.", ""]
+    if not full_backlog:
+        nb = len([r for r in rows if r["bucket"] == "Бэклог"])
+        if nb: L += [f"_Бэклог ({nb}) свёрнут: показаны только карточки со спринтом, "
+                     f"сроком или блокировкой. Полный список — ключ `--backlog`._", ""]
+
+    over, soon, blocked = inv_attention(rows, today)
+    L += ["## Требует внимания", ""]
+    if not (over or soon or blocked):
+        L.append("Ничего: просроченных нет, со сроком на сегодня-завтра нет, заблокированных нет.")
+    for name, rs in (("Просрочены", over), ("Срок сегодня или завтра", soon),
+                     ("Заблокированы", blocked)):
+        if not rs: continue
+        L += [f"**{name}: {len(rs)}**", ""]
+        for r in rs: L.append(f"- {r['pr']} · {inv_line(r, base_url)}")
+        L.append("")
+
+    L += ["## Все открытые", ""]
+    byproj = {}
+    for r in rows: byproj.setdefault(r["pr"], []).append(r)
+    for pr in sorted(byproj):
+        rs = byproj[pr]
+        nosp = all(not x["sprint"] for x in rs)
+        L.append(f"### {pr}" + (" _(ни у одной нет спринта)_" if nosp else ""))
+        bym = {}
+        for r in rs: bym.setdefault(r["bucket"], []).append(r)
+        for b in INV_ORDER:
+            if b not in bym: continue
+            L.append("")
+            # Бэклог — две трети списка и никто его не читает. Разворачиваем
+            # только то, что в нём выглядит странно: со спринтом, со сроком
+            # или заблокированное. Остальное числом.
+            if b == "Бэклог" and not full_backlog:
+                odd = [r for r in bym[b] if r["sprint"] or r["due"] or r["blocked"]]
+                L.append(f"**Бэклог** — {len(bym[b])}" +
+                         (f", из них требуют взгляда {len(odd)}" if odd else ""))
+                for r in odd: L.append(f"- {inv_line(r, base_url)}")
+                continue
+            L.append(f"**{b}** — {len(bym[b])}")
+            for r in bym[b]: L.append(f"- {inv_line(r, base_url)}")
+        L.append("")
+
+    L += [f"## Сравнение с {prev_day or '—'}", ""]
+    if not prev_rows:
+        L.append("_Предыдущего снимка нет: сравнение появится со следующего прогона._")
+        return L
+    new, gone, moved = inv_diff(rows, prev_rows)
+    pk = collections.Counter(r["kind"] for r in prev_rows)
+    d = lambda a, b: f"{a} → {b} ({b-a:+d})" if a != b else f"{a} → {b} (0)"
+    L += ["| | было → стало |", "|---|---|",
+          f"| всего | {d(len(prev_rows), len(rows))} |",
+          f"| истории | {d(pk['us'], kinds['us'])} |",
+          f"| задачи | {d(pk['task'], kinds['task'])} |",
+          f"| вопросы | {d(pk['issue'], kinds['issue'])} |", ""]
+    for ic, name, rs in (("🆕", "Новые", new), ("✅", "Ушли из списка", gone)):
+        if not rs: continue
+        prs = sorted({r["pr"] for r in rs})
+        L += [f"**{ic} {name}: {len(rs)}**" + (f" — {prs[0]}" if len(prs) == 1 else ""), ""]
+        for r in rs: L.append(f"- {r['pr']} · {inv_line(r, base_url)}")
+        L.append("")
+    if moved:
+        L += [f"**🔄 Сменили колонку: {len(moved)}**", ""]
+        for o, nw in moved:
+            L.append(f"- {nw['pr']} · {inv_line(nw, base_url)} · {o['bucket']} → {nw['bucket']}")
+        L.append("")
+    return L
+
+def cmd_inventory(args):
+    import datetime, collections
+    if args.install or args.uninstall:
+        exe = str(pathlib.Path(sys.argv[0]).resolve())
+        if sys.platform != "darwin":
+            return cron_job("inventory", [("45 8 * * 1-5", ["inventory", "--send"])], args.uninstall)
+        plist = HOME / "Library" / "LaunchAgents" / "kz.taiga-kit.inventory.plist"
+        if args.uninstall:
+            subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+            if plist.exists(): plist.unlink()
+            ok(f"расписание снято: {plist}"); return
+        log = HOME / ".taiga-kit"; log.mkdir(parents=True, exist_ok=True)
+        hh, _, mm = args.at.partition(":")
+        days = "".join(f"    <dict><key>Weekday</key><integer>{d}</integer>"
+                       f"<key>Hour</key><integer>{int(hh)}</integer>"
+                       f"<key>Minute</key><integer>{int(mm or 0)}</integer></dict>\n" for d in range(1, 6))
+        plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>kz.taiga-kit.inventory</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{exe}</string><string>inventory</string><string>--send</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{os.path.expanduser("~/.local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StartCalendarInterval</key>
+  <array>
+{days}  </array>
+  <key>StandardOutPath</key><string>{log}/inventory.log</string>
+  <key>StandardErrorPath</key><string>{log}/inventory.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+""")
+        subprocess.run(["launchctl","unload",str(plist)], capture_output=True)
+        r = subprocess.run(["launchctl","load",str(plist)], capture_output=True, text=True)
+        if r.returncode: die(f"launchctl: {r.stderr.strip()}")
+        ok(f"расписание поставлено: будни {int(hh):02d}:{int(mm or 0):02d} · {plist}"); return
+    auth()
+    today = datetime.date.today().isoformat()
+    c, projects = api("GET", "/projects")
+    if projects == []: die("список проектов пуст при подтверждённой личности — подозрительно")
+    rows = inv_collect(projects)
+    prev_day, prev_rows = inv_snap_prev(today)
+    L = inv_report(rows, prev_day, prev_rows, today, base(), args.backlog)
+    rd = reports_dir(); rd.mkdir(parents=True, exist_ok=True)
+    out = rd / f"Опись_{today}.md"
+    out.write_text("\n".join(L) + "\n")
+    if not args.dry: inv_snap_save(today, rows)
+    ok(str(out))
+    k = collections.Counter(r["kind"] for r in rows)
+    ok(f"открыто {len(rows)}: историй {k['us']}, задач {k['task']}, вопросов {k['issue']}")
+    if prev_rows:
+        new, gone, moved = inv_diff(rows, prev_rows)
+        ok(f"против {prev_day}: новых {len(new)}, ушло {len(gone)}, сменили колонку {len(moved)}")
+    else:
+        ok("предыдущего снимка нет — сравнение будет со следующего прогона")
+    if args.send:
+        sent = 0
+        rec = cfg_load().get("telegram_recipients", {})
+        for cid, sb in subs_load().items():
+            if not sb.get("evening"): continue
+            who = next((v["name"] for v in rec.values() if int(v["chat_id"]) == int(cid)),
+                       sb.get("name") or cid)
+            # Руководителю — только его проекты: чужая опись ему не нужна
+            # и мешает увидеть своё.
+            rp = roster().get(roster_alias(who)) or {}
+            mine, suffix = rows, out
+            if not rp.get("all_projects") and rp.get("projects"):
+                keep = set(rp["projects"])
+                mine = [r for r in rows if r["slug"] in keep]
+                pm = [r for r in (prev_rows or []) if r["slug"] in keep]
+                txt = inv_report(mine, prev_day, pm, today, base(), args.backlog)
+                suffix = rd / f"Опись_{today}_{roster_alias(who).split()[-1]}.md"
+                suffix.write_text("\n".join(txt) + "\n")
+            r = tg_document(int(cid), suffix,
+                            f"Опись открытого на {datetime.date.fromisoformat(today):%d.%m.%Y}"
+                            + (f" · {len(mine)} карточек" if mine is not rows else ""))
+            if r.get("ok"): sent += 1
+            else: ok(f"  → {who}: ОШИБКА {r.get('description')}")
+        ok(f"  отправлено файлом: {sent}")
+    return out
+
 def cmd_standup(args):
     import datetime
     if args.install or args.uninstall: return standup_install(args)
@@ -4180,6 +4427,14 @@ def main():
     rc.add_argument("--start", default="9", metavar="Ч")
     rc.add_argument("--end", default="19", metavar="Ч")
     rc.set_defaults(fn=cmd_recon)
+    iv = P("inventory")
+    iv.add_argument("--send", action="store_true", help="разослать файлом руководителям")
+    iv.add_argument("--dry", action="store_true", help="не сохранять снимок")
+    iv.add_argument("--backlog", action="store_true", help="разворачивать бэклог целиком")
+    iv.add_argument("--install", action="store_true", help="расписание: будни 08:45")
+    iv.add_argument("--uninstall", action="store_true")
+    iv.add_argument("--at", default="8:45", metavar="ЧЧ:ММ")
+    iv.set_defaults(fn=cmd_inventory)
     rt = P("rituals")
     rt.add_argument("--week", help="любая дата нужной недели, ГГГГ-ММ-ДД")
     rt.add_argument("--managers", metavar="ИМЕНА", help="через запятую (запоминается)")

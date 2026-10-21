@@ -263,7 +263,9 @@ taiga watch [--dry] [--days N] [--install|--uninstall]
 taiga registry [--scan] [--forget <слаг>]
                           реестр «слаг → папка с кодом», ~/.taiga-kit/projects.json
 taiga users
-taiga sprints              список спринтов проекта, текущий помечен стрелкой [-p <слаг>]    люди инстанса или участники проекта и его роли
+taiga sprints              список спринтов проекта, текущий помечен стрелкой
+taiga inventory [--send] [--backlog] [--install [--at ЧЧ:ММ]|--uninstall]
+                          опись открытого + сравнение со вчерашним снимком [-p <слаг>]    люди инстанса или участники проекта и его роли
 taiga new-project "Имя" --desc "описание"
        [--duplicate <слаг>]   копия устройства проекта: каталоги, роли, поля
        [--sample <слаг>]      только колонки канбана
