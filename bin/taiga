@@ -2854,21 +2854,28 @@ def digest_text(name, d, kind):
             if len(rows) > 6: L.append(f"  …и ещё {len(rows)-6}")
         if not d["closed"] and not groups:
             L.append(f"За {d.get('day','сегодня')} карточки не двигались.")
-        # Судьба своих карточек в тестировании — для разработчика это
-        # и есть главный итог дня: проверили или вернули.
-        for ic, name, rows in (("\u2705", "Прошли тест", d.get("passed_t") or []),
-                               ("\U0001F41E", "Вернулись из теста", d.get("back_t") or [])):
-            if not rows: continue
-            L += ["", f"{ic} {name}: {len(rows)}"]
-            for r in rows[:5]:
-                L.append(f"  {r['pr']} #{r['ref']} · {cut(r['subj'], 58)} · {r['who']}")
-            if len(rows) > 5: L.append(f"  …и ещё {len(rows)-5}")
-        wt = d.get("wait_test") or []
+        # Судьба своих карточек в тестировании. Сначала счёт и голые
+        # номера — чтобы охватить одним взглядом, ниже расшифровка.
+        pt = d.get("passed_t") or []
+        bt = d.get("back_t") or []
+        wt = sorted(d.get("wait_test") or [], key=lambda x: -x["age"])
+        nums = lambda rows: ", ".join(f"#{r['ref']}" for r in rows)
+        head = []
+        if pt: head.append(f"\u2705 Прошли тест: {len(pt)} — {nums(pt)}")
+        if bt: head.append(f"\U0001F41E Вернулись в баги: {len(bt)} — {nums(bt)}")
+        if wt: head.append(f"\U0001F9EA Ждут проверки: {len(wt)} — {nums(wt[:12])}"
+                           + (" …" if len(wt) > 12 else ""))
+        if head:
+            L += [""] + head
+        if pt or bt:
+            L += ["", "── расшифровка ──"]
+            for r in pt: L.append(f"\u2705 {r['pr']} #{r['ref']} · {cut(r['subj'], 64)}")
+            for r in bt: L.append(f"\U0001F41E {r['pr']} #{r['ref']} · {cut(r['subj'], 64)}")
         if wt:
-            L += ["", f"\U0001F9EA Ждут проверки: {len(wt)}"]
-            for r in sorted(wt, key=lambda x: -x["age"])[:4]:
-                L.append(f"  {r['pr']} #{r['ref']} · {r['age']}д · {cut(r['subj'], 56)}")
-            if len(wt) > 4: L.append(f"  …и ещё {len(wt)-4}")
+            L += ["", "Ждут проверки:"]
+            for r in wt[:8]:
+                L.append(f"  {r['pr']} #{r['ref']} · {r['age']}д · {cut(r['subj'], 54)}")
+            if len(wt) > 8: L.append(f"  …и ещё {len(wt)-8}")
         inwork = [r for r in d["mine"] if "progress" in r["st"].lower()]
         if inwork:
             L.append("")
