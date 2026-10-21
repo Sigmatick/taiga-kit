@@ -3163,10 +3163,15 @@ def notify_install(args):
         die("часы должны быть 0–23 и --start не позже --end")
     days = range(0, 7) if args.all_days else range(1, 6)
     hour_list = list(range(h_from, h_to + 1, every))
-    # :15 — чтобы не бить по API одновременно с дозорным, который ходит в :05
+    # Минуты внутри часа: прогон занимает около 20 секунд, поэтому ходить
+    # можно часто. Смещение от нуля — чтобы не бить по API одновременно
+    # с дозорным, который ходит в :05.
+    step = max(1, int(getattr(args, "every_min", 0) or 60))
+    mins = [m for m in range(15, 60, step)] if step < 60 else [15]
+    if step < 60: mins = sorted({(15 + i * step) % 60 for i in range(60 // step)})
     hours = "".join(f"    <dict><key>Weekday</key><integer>{d}</integer>"
-                    f"<key>Hour</key><integer>{h}</integer><key>Minute</key><integer>15</integer></dict>\n"
-                    for d in days for h in hour_list)
+                    f"<key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{mi}</integer></dict>\n"
+                    for d in days for h in hour_list for mi in mins)
     log = HOME / ".taiga-kit"; log.mkdir(parents=True, exist_ok=True)
     plist.parent.mkdir(parents=True, exist_ok=True)
     plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -3191,8 +3196,11 @@ def notify_install(args):
     r = subprocess.run(["launchctl","load",str(plist)], capture_output=True, text=True)
     if r.returncode: die(f"launchctl: {r.stderr.strip()}")
     ok(f"расписание поставлено: {plist}")
-    ok(f"{'каждый час' if every == 1 else f'каждые {every} ч'} с {h_from}:15 до {h_to}:15, "
-       f"{'все дни' if args.all_days else 'по будням'}")
+    per = (f"каждые {step} мин" if step < 60 else
+           "каждый час" if every == 1 else f"каждые {every} ч")
+    ok(f"{per} с {h_from} до {h_to} часов, "
+       f"{'все дни' if args.all_days else 'по будням'} "
+       f"({len(mins) * len(hour_list) * len(list(days))} прогонов в неделю)")
     ok(f"журнал: {log}/notify.log")
     ok("ставить только на одной машине: каждая копия шлёт всем получателям")
     ok("снять: taiga notify --uninstall")
@@ -4147,6 +4155,8 @@ def main():
     nt.add_argument("--install", action="store_true", help="расписание: ежечасно 9–19 по будням")
     nt.add_argument("--uninstall", action="store_true")
     nt.add_argument("--every", default="1", metavar="Ч", help="период опроса в часах")
+    nt.add_argument("--every-min", metavar="МИН",
+                    help="период в минутах внутри часа: 15 — четыре раза в час")
     nt.add_argument("--start", default="9", metavar="Ч", help="с какого часа")
     nt.add_argument("--end", default="19", metavar="Ч", help="по какой час")
     nt.add_argument("--all-days", action="store_true", help="включая выходные")
