@@ -504,6 +504,53 @@ def cmd_assign(args):
     if c != 200: die(f"{c}: {r}")
     ok(f"#{r['ref']} назначена: {(r.get('assigned_to_extra_info') or {}).get('full_name_display')}")
 
+MIME = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg", ".gif": "image/gif", ".md": "text/markdown",
+        ".txt": "text/plain", ".csv": "text/csv", ".zip": "application/zip",
+        ".json": "application/json", ".log": "text/plain",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}
+
+def cmd_attach(args):
+    """Вложить файл в карточку. Многочастный запрос собираем руками:
+    внешних зависимостей в ките нет, а attachments без них не загрузить."""
+    p = project(args); pid = p["id"]; kind = args.kind or "us"
+    f = pathlib.Path(os.path.expanduser(args.file))
+    if not f.is_file(): die(f"файла нет: {f}")
+    size = f.stat().st_size
+    if size > 20 * 1024 * 1024:
+        die(f"файл {size // 1024 // 1024} МБ — крупновато для трекера, "
+            f"положите в хранилище и дайте ссылку комментарием")
+    c, o = find_item(pid, args.ref, kind)
+    if not confirm(args, f"вложить «{f.name}» ({size // 1024 or 1} КБ) "
+                         f"в {KINDS[kind][3]} #{args.ref} «{o['subject'][:44]}»"): return
+    b = "----taigakit" + hex(int(time.time() * 1000))[2:]
+    nl = b"\r\n"
+    body = b""
+    fields = [("project", str(pid)), ("object_id", str(o["id"]))]
+    if args.desc: fields.append(("description", args.desc))
+    for k, v in fields:
+        body += (b"--" + b.encode() + nl
+                 + f'Content-Disposition: form-data; name="{k}"'.encode() + nl + nl
+                 + str(v).encode() + nl)
+    ct = MIME.get(f.suffix.lower(), "application/octet-stream")
+    body += (b"--" + b.encode() + nl
+             + f'Content-Disposition: form-data; name="attached_file"; filename="{f.name}"'.encode()
+             + nl + f"Content-Type: {ct}".encode() + nl + nl
+             + f.read_bytes() + nl + b"--" + b.encode() + b"--" + nl)
+    req = urllib.request.Request(base() + f"/api/v1/{KINDS[kind][0]}/attachments",
+                                 data=body, method="POST")
+    req.add_header("Authorization", "Bearer " + tok())
+    req.add_header("Content-Type", f"multipart/form-data; boundary={b}")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as x:
+            r = json.loads(x.read().decode())
+    except urllib.error.HTTPError as e:
+        die(f"{e.code}: {e.read().decode()[:300]}")
+    ok(f"вложено: {r.get('name')} · {r.get('size')} байт")
+    ok(f"  {r.get('url','')}")
+
 def cmd_comment(args):
     p = project(args); kind, it = find_item(p["id"], args.ref, args.kind)
     c, h = api("GET", f"/history/{KINDS[kind][1]}/{it['id']}")
@@ -4141,6 +4188,9 @@ def main():
     sy.set_defaults(fn=cmd_sync)
     pl = P("plan"); pl.add_argument("file"); pl.set_defaults(fn=cmd_plan)
     apl = P("apply"); apl.add_argument("file"); apl.set_defaults(fn=cmd_apply)
+    at = P("attach"); at.add_argument("ref"); at.add_argument("file")
+    at.add_argument("--desc", help="подпись к вложению")
+    at.set_defaults(fn=cmd_attach)
     cm = P("comment"); cm.add_argument("ref"); cm.add_argument("text"); cm.add_argument("--force", action="store_true"); cm.set_defaults(fn=cmd_comment)
     args = ap.parse_args(); args.fn(args)
 
