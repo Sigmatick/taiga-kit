@@ -405,6 +405,44 @@ def cmd_show(args):
             v = e["values_diff"]["status"]
             ok(f"    {e['created_at'][:16]}  {(e.get('user') or {}).get('name','?'):<22} {v[0]} → {v[1]}")
 
+def resolve_sprint(pid, text):
+    """Спринт по названию или «текущий» — по датам. Закрытые не предлагаем:
+    положить карточку в закрытый спринт значит спрятать её."""
+    import datetime
+    c, ms = api("GET", f"/milestones?project={pid}")
+    ms = ms or []
+    if not ms: die("в проекте нет ни одного спринта")
+    if (text or "").strip().lower() in ("текущий", "current", "now", ""):
+        today = datetime.date.today().isoformat()
+        cur = [x for x in ms if not x.get("closed")
+               and (x.get("estimated_start") or "9999") <= today <= (x.get("estimated_finish") or "0000")]
+        if len(cur) == 1: return cur[0]
+        if not cur:
+            opened = [x for x in ms if not x.get("closed")]
+            die("текущего спринта нет: " + ("открытых спринтов тоже нет, все закрыты"
+                if not opened else "открыты " + ", ".join(f"«{x['name']}»" for x in opened)
+                + ", но ни один не включает сегодняшнюю дату"))
+        die("под сегодня подходят несколько: " + ", ".join(f"«{x['name']}»" for x in cur))
+    hit = [x for x in ms if (text or "").strip().lower() in x["name"].lower()]
+    if not hit: die("спринт не найден. Есть: " + ", ".join(f"«{x['name']}»" for x in ms))
+    if len(hit) > 1: die("подходят несколько: " + ", ".join(f"«{x['name']}»" for x in hit))
+    return hit[0]
+
+def cmd_sprints(args):
+    import datetime
+    p = project(args); pid = p["id"]
+    c, ms = api("GET", f"/milestones?project={pid}")
+    today = datetime.date.today().isoformat()
+    ok(f"{p['name']}: спринтов {len(ms or [])}")
+    for x in sorted(ms or [], key=lambda z: z.get("estimated_start") or ""):
+        a, b = x.get("estimated_start"), x.get("estimated_finish")
+        cur = a and b and a <= today <= b and not x.get("closed")
+        ok(f"  {'→' if cur else ' '} {x['name']:<28} {a} … {b}"
+           + ("  закрыт" if x.get("closed") else ""))
+    if not any((x.get('estimated_start') or '9999') <= today <= (x.get('estimated_finish') or '0000')
+               and not x.get('closed') for x in (ms or [])):
+        ok("  текущего спринта нет")
+
 def cmd_new(args):
     p = project(args); pid = p["id"]; kind = args.kind or "us"
     if kind == "epic" and not p.get("is_epics_activated"): die("модуль эпиков в проекте выключен")
@@ -414,6 +452,8 @@ def cmd_new(args):
         _, par = find_item(pid, args.parent, "us"); body["user_story"] = par["id"]
     if args.assign: body["assigned_to"] = resolve_member(pid, args.assign)["user"]
     if args.status: body["status"] = resolve_status(pid, kind, args.status)["id"]
+    if args.sprint is not None:
+        body["milestone"] = resolve_sprint(pid, args.sprint)["id"]
     if args.desc_file:
         f = pathlib.Path(os.path.expanduser(args.desc_file))
         if not f.is_file(): die(f"файл описания не найден: {f}")
@@ -427,6 +467,8 @@ def cmd_new(args):
     dup = [i for i in (ex or []) if i["subject"].strip().lower() == args.subject.strip().lower()]
     if dup and not args.force: die(f"уже есть #{dup[0]['ref']} с таким названием — повторить можно с --force")
     what = f"создать {KINDS[kind][3]} в «{p['name']}»: {args.subject}"
+    if body.get("milestone"):
+        what += f"\n       спринт: {resolve_sprint(pid, args.sprint)['name']}"
     if body.get("description"):
         what += "\n       описание: " + cut(" ".join(body["description"].split()), 140)
     if not confirm(args, what): return
@@ -3978,6 +4020,8 @@ def main():
     l = P("ls"); l.add_argument("--open", action="store_true"); l.add_argument("--mine", action="store_true"); l.add_argument("--status"); l.set_defaults(fn=cmd_ls)
     s = P("show"); s.add_argument("ref"); s.set_defaults(fn=cmd_show)
     n = P("new"); n.add_argument("subject"); n.add_argument("--parent"); n.add_argument("--assign"); n.add_argument("--status")
+    n.add_argument("--sprint", nargs="?", const="текущий", metavar="НАЗВАНИЕ",
+                   help="положить в спринт; без значения — в текущий по датам")
     n.add_argument("--desc", help="описание; \\n разворачивается в перенос строки")
     n.add_argument("--desc-file", metavar="ФАЙЛ", help="описание из файла, как есть")
     n.add_argument("--force", action="store_true"); n.set_defaults(fn=cmd_new)
@@ -3993,6 +4037,7 @@ def main():
     np.add_argument("--role", help="роль добавляемых участников")
     np.set_defaults(fn=cmd_new_project)
     P("users").set_defaults(fn=cmd_users)
+    P("sprints").set_defaults(fn=cmd_sprints)
     rp = P("report"); rp.add_argument("--day", help="конкретная дата ГГГГ-ММ-ДД")
     rp.add_argument("--install", action="store_true", help="расписание: будни 09:00")
     rp.add_argument("--uninstall", action="store_true"); rp.add_argument("--quiet", action="store_true")
