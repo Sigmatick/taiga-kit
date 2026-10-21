@@ -1848,13 +1848,19 @@ def cmd_standup(args):
             if not tgt: ok(f"  {b['pm']}: нет связанного чата — не отправлено"); continue
             # Человек мог отметить себе проекты в боте — тогда тестирование
             # показываем только по ним. Не отмечал — показываем всё.
-            # Нет записи в боте — человек ничего не настраивал, шлём всё.
-            # Есть запись, но проектов нет — он сам снял все галочки, и бот
-            # ему об этом написал; показывать вопреки этому нельзя.
-            sb = subs.get(str(tgt["chat_id"]))
+            # Проекты руководителя берём из карты команды: он отвечает
+            # за свои, и статистика по чужим ему только мешает. Карта
+            # главнее галочек в боте — она описывает устройство отдела,
+            # а не предпочтения. Кому положено видеть всё — видит всё.
+            rp = roster().get(roster_alias(b["pm"])) or {}
             only = None
-            if sb is not None and sb.get("evening"):
-                only = {slug2name.get(x, x) for x in (sb.get("projects") or [])}
+            if not rp.get("all_projects"):
+                if rp.get("projects"):
+                    only = {slug2name.get(x, x) for x in rp["projects"]}
+                else:
+                    sb = subs.get(str(tgt["chat_id"]))
+                    if sb is not None and sb.get("evening"):
+                        only = {slug2name.get(x, x) for x in (sb.get("projects") or [])}
             r = tg_call("sendMessage", {"chat_id": tgt["chat_id"],
                                         "text": standup_tg(b, day) + "\n"
                                                 + "\n".join(test_tg(events, q, only))
@@ -2761,6 +2767,10 @@ def digest_data(uid, need_closed=False):
     # девять карточек на проверку, выглядел пустым. Собираем ВСЕ переходы:
     # передача в тест — такой же результат, как закрытие.
     mine, stuck, closed_y, fresh, moves = [], [], [], [], []
+    # Судьба СВОИХ карточек в тестировании. Переходы по ним делает
+    # тестировщик, не владелец, поэтому фильтр по автору перехода тут
+    # не годится: смотрим на карточки, назначенные на человека.
+    wait_test, passed_t, back_t = [], [], []
     c, projects = api("GET", "/projects")
     for p in (projects or []):
         pid, pname = p["id"], p["name"]
@@ -2777,6 +2787,7 @@ def digest_data(uid, need_closed=False):
                 rec = {"pr": pname, "ref": o["ref"], "st": nm, "subj": o["subject"], "age": age}
                 if o.get("assigned_to") == uid and not closed:
                     mine.append(rec)
+                    if TEST_COL in nm.lower(): wait_test.append(rec)
                     if "progress" in nm.lower() and age >= 7: stuck.append(rec)
                 cd = _d(o.get("created_date"))
                 if cd and w_from <= cd < w_to and not o.get("assigned_to"): fresh.append(rec)
@@ -2784,6 +2795,18 @@ def digest_data(uid, need_closed=False):
                 # в окне: иначе это сотни запросов и минуты ожидания
                 if need_closed and o.get("modified_date") and _d(o["modified_date"]) >= d_from:
                     c2, h = api("GET", f"/history/{api_name}/{o['id']}")
+                    if o.get("assigned_to") == uid:
+                        for e in (h or []):          # кто двигал — неважно
+                            vd = e.get("values_diff") or {}
+                            if "status" not in vd: continue
+                            tm = _d(e["created_at"])
+                            if not (tm and d_from <= tm < d_to): continue
+                            was, to = str(vd["status"][0]), str(vd["status"][1])
+                            if TEST_COL not in was.lower(): continue
+                            r2 = dict(rec, **{"from": was, "to": to,
+                                              "who": (e.get("user") or {}).get("name") or "?"})
+                            if closed_by_name.get(to.strip().lower()): passed_t.append(r2)
+                            elif "bug" in to.lower(): back_t.append(r2)
                     for e in (h or []):
                         vd = e.get("values_diff") or {}
                         if "status" not in vd: continue
@@ -2801,7 +2824,8 @@ def digest_data(uid, need_closed=False):
                             closed_y.append(rec)
     moves.sort(key=lambda x: x["at"])
     return {"mine": mine, "stuck": stuck, "closed": closed_y, "fresh": fresh,
-            "moves": moves, "period": f"{prev:%d.%m}", "day": f"{today:%d.%m}"}
+            "moves": moves, "wait_test": wait_test, "passed_t": passed_t,
+            "back_t": back_t, "period": f"{prev:%d.%m}", "day": f"{today:%d.%m}"}
 
 def digest_text(name, d, kind):
     import datetime
@@ -2830,6 +2854,21 @@ def digest_text(name, d, kind):
             if len(rows) > 6: L.append(f"  …и ещё {len(rows)-6}")
         if not d["closed"] and not groups:
             L.append(f"За {d.get('day','сегодня')} карточки не двигались.")
+        # Судьба своих карточек в тестировании — для разработчика это
+        # и есть главный итог дня: проверили или вернули.
+        for ic, name, rows in (("\u2705", "Прошли тест", d.get("passed_t") or []),
+                               ("\U0001F41E", "Вернулись из теста", d.get("back_t") or [])):
+            if not rows: continue
+            L += ["", f"{ic} {name}: {len(rows)}"]
+            for r in rows[:5]:
+                L.append(f"  {r['pr']} #{r['ref']} · {cut(r['subj'], 58)} · {r['who']}")
+            if len(rows) > 5: L.append(f"  …и ещё {len(rows)-5}")
+        wt = d.get("wait_test") or []
+        if wt:
+            L += ["", f"\U0001F9EA Ждут проверки: {len(wt)}"]
+            for r in sorted(wt, key=lambda x: -x["age"])[:4]:
+                L.append(f"  {r['pr']} #{r['ref']} · {r['age']}д · {cut(r['subj'], 56)}")
+            if len(wt) > 4: L.append(f"  …и ещё {len(wt)-4}")
         inwork = [r for r in d["mine"] if "progress" in r["st"].lower()]
         if inwork:
             L.append("")
