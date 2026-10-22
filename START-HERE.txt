@@ -103,10 +103,11 @@ Taiga в Claude Code
 
 ЧТО ЧИТАТЬ
 
-  Taiga-for-managers.docx   инструкция для тех, кто ведёт задачи
-  FOR-MANAGERS.md                         она же в текстовом виде
-  FOR-DEVELOPERS.md                      дозорный, реестр, разбор тикетов по коду
-  README.md                                 полное описание
+  Taiga-for-managers.docx     тем, кто ведёт задачи
+  Taiga-for-developers.docx   дозорный, разведка по коду, вложения
+  FOR-MANAGERS.md             то же в текстовом виде
+  FOR-DEVELOPERS.md           то же в текстовом виде
+  README.md                   полное описание: команды, расписания, ловушки
 
 
 ЧТО НУЖНО ЗАРАНЕЕ

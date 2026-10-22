@@ -4,7 +4,7 @@
 const fs = require("fs");
 const {
   Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell,
-  WidthType, ShadingType, BorderStyle, AlignmentType, PageOrientation,
+  WidthType, ShadingType, BorderStyle, PageOrientation, ExternalHyperlink,
 } = require("docx");
 
 const [, , SRC, OUT, TITLE] = process.argv;
@@ -13,16 +13,28 @@ const md = fs.readFileSync(SRC, "utf8").split("\n");
 const PAGE_W = 11906, MARGIN = 1134;          // A4 книжная, поля 2 см
 const CONTENT = PAGE_W - MARGIN * 2;
 
-// Разбор строки на куски: **жирный**, `код`, остальное.
+// Разбор строки на куски: **жирный**, `код`, [ссылка](адрес), остальное.
+// Ссылку на соседний файл делать гиперссылкой бессмысленно — в выданном
+// документе её некуда вести, поэтому остаётся только подпись.
 function runs(text, base = {}) {
   const out = [];
-  const re = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+  const re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g;
   let i = 0, m;
   while ((m = re.exec(text)) !== null) {
     if (m.index > i) out.push(new TextRun({ ...base, text: text.slice(i, m.index) }));
     const t = m[0];
-    if (t.startsWith("**")) out.push(new TextRun({ ...base, text: t.slice(2, -2), bold: true }));
-    else out.push(new TextRun({ ...base, text: t.slice(1, -1), font: "Menlo", size: 19 }));
+    if (t.startsWith("**")) {
+      out.push(new TextRun({ ...base, text: t.slice(2, -2), bold: true }));
+    } else if (t.startsWith("`")) {
+      out.push(new TextRun({ ...base, text: t.slice(1, -1), font: "Menlo", size: 19 }));
+    } else {
+      const lm = t.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      const [, label, href] = lm;
+      out.push(/^https?:/.test(href)
+        ? new ExternalHyperlink({ link: href, children: [new TextRun({
+            ...base, text: label, style: "Hyperlink" })] })
+        : new TextRun({ ...base, text: label, font: "Menlo", size: 19 }));
+    }
     i = m.index + t.length;
   }
   if (i < text.length) out.push(new TextRun({ ...base, text: text.slice(i) }));
