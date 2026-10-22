@@ -1799,6 +1799,7 @@ def inv_collect(projects):
                     "parent": par, "due": o.get("due_date"),
                     "blocked": bool(o.get("is_blocked")),
                     "who": (o.get("assigned_to_extra_info") or {}).get("full_name_display") or "",
+                    "uid": o.get("assigned_to"),
                 })
     rows.sort(key=lambda x: (x["pr"], INV_ORDER.index(x["bucket"]) if x["bucket"] in INV_ORDER else 9, -x["ref"]))
     return rows
@@ -1850,7 +1851,23 @@ def inv_line(r, base_url):
     if r["blocked"]: tail.append("ЗАБЛОКИРОВАНА")
     return s + (" · " + ", ".join(tail) if tail else "")
 
-def inv_report(rows, prev_day, prev_rows, today, base_url, full_backlog=False):
+def inv_mine_block(rows, uid, base_url):
+    """Свои карточки первым разделом: человек открывает файл ради них,
+    а не ради описи всего отдела."""
+    mine = [r for r in rows if r.get("uid") == uid]
+    if not mine: return ["## Ваши карточки", "", "_На вас ничего не открыто._", ""]
+    bym = {}
+    for r in mine: bym.setdefault(r["bucket"], []).append(r)
+    head = ", ".join(f"{b.lower()} {len(bym[b])}" for b in INV_ORDER if b in bym)
+    L = [f"## Ваши карточки — {len(mine)}", "", head, ""]
+    for b in INV_ORDER:
+        if b not in bym: continue
+        L.append(f"**{b}** — {len(bym[b])}")
+        for r in bym[b]: L.append(f"- {r['pr']} · {inv_line(r, base_url)}")
+        L.append("")
+    return L
+
+def inv_report(rows, prev_day, prev_rows, today, base_url, full_backlog=False, uid=None):
     import datetime, collections
     kinds = collections.Counter(r["kind"] for r in rows)
     L = [f"# Taiga — {datetime.date.fromisoformat(today):%d.%m.%Y}", "",
@@ -1861,6 +1878,7 @@ def inv_report(rows, prev_day, prev_rows, today, base_url, full_backlog=False):
         if nb: L += [f"_Бэклог ({nb}) свёрнут: показаны только карточки со спринтом, "
                      f"сроком или блокировкой. Полный список — ключ `--backlog`._", ""]
 
+    if uid is not None: L += inv_mine_block(rows, uid, base_url)
     over, soon, blocked = inv_attention(rows, today)
     L += ["## Требует внимания", ""]
     if not (over or soon or blocked):
@@ -1966,7 +1984,7 @@ def cmd_inventory(args):
     if projects == []: die("список проектов пуст при подтверждённой личности — подозрительно")
     rows = inv_collect(projects)
     prev_day, prev_rows = inv_snap_prev(today)
-    L = inv_report(rows, prev_day, prev_rows, today, base(), args.backlog)
+    L = inv_report(rows, prev_day, prev_rows, today, base(), args.backlog, IDENTITY["id"])
     rd = reports_dir(); rd.mkdir(parents=True, exist_ok=True)
     out = rd / f"Опись_{today}.md"
     out.write_text("\n".join(L) + "\n")
@@ -1989,12 +2007,17 @@ def cmd_inventory(args):
             # Руководителю — только его проекты: чужая опись ему не нужна
             # и мешает увидеть своё.
             rp = roster().get(roster_alias(who)) or {}
+            ruid = next((int(k) for k, v in rec.items() if v["name"] == who), None)
             mine, suffix = rows, out
             if not rp.get("all_projects") and rp.get("projects"):
                 keep = set(rp["projects"])
                 mine = [r for r in rows if r["slug"] in keep]
                 pm = [r for r in (prev_rows or []) if r["slug"] in keep]
-                txt = inv_report(mine, prev_day, pm, today, base(), args.backlog)
+                txt = inv_report(mine, prev_day, pm, today, base(), args.backlog, ruid)
+                suffix = rd / f"Опись_{today}_{roster_alias(who).split()[-1]}.md"
+                suffix.write_text("\n".join(txt) + "\n")
+            if mine is rows and ruid is not None and ruid != IDENTITY["id"]:
+                txt = inv_report(rows, prev_day, prev_rows, today, base(), args.backlog, ruid)
                 suffix = rd / f"Опись_{today}_{roster_alias(who).split()[-1]}.md"
                 suffix.write_text("\n".join(txt) + "\n")
             r = tg_document(int(cid), suffix,
