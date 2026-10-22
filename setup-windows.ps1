@@ -132,7 +132,15 @@ Bold 'Шаг 2 из 5. Плагин Claude Code'
 if (-not $script:Claude) {
     Warn '  пропускаю: claude не найден. Поставьте его и запустите установщик снова.'
 } elseif ((& $script:Claude plugin list 2>$null) -match 'taiga-kit') {
-    Write-Host '  уже установлен'
+    # Пропускать нельзя: программа обновится, а навык останется старым —
+    # кэш плагина привязан к версии и сам не перечитывается.
+    Write-Host '  уже стоит — обновляю'
+    try { & $script:Claude plugin marketplace update taiga-kit 2>$null | Out-Null }
+    catch { try { & $script:Claude plugin marketplace update 2>$null | Out-Null } catch {} }
+    try   { & $script:Claude plugin update taiga-kit@taiga-kit 2>$null | Out-Null
+            Write-Host '  плагин обновлён' }
+    catch { Warn '  обновить не удалось — см. README, раздел про обновление' }
+    Write-Host '  ПЕРЕЗАПУСТИТЕ Claude Code: без этого останется старый навык.'
 } else {
     Write-Host '  подключаю каталог и ставлю плагин…'
     try   { & $script:Claude plugin marketplace add Sigmatick/taiga-kit 2>$null | Out-Null }

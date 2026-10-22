@@ -65,7 +65,16 @@ done
 # ── 2. плагин ───────────────────────────────────────────────────────────────
 bold "Шаг 2 из 5. Плагин Claude Code"
 if claude plugin list 2>/dev/null | grep -q "taiga-kit"; then
-  echo "  уже установлен"
+  # Раньше здесь стояло «уже установлен» и шаг пропускался. Из-за этого
+  # после повторной установки программа обновлялась, а навык оставался
+  # старым — кэш плагина привязан к версии и сам не перечитывается.
+  echo "  уже стоит — обновляю"
+  claude plugin marketplace update taiga-kit >/dev/null 2>&1 \
+    || claude plugin marketplace update >/dev/null 2>&1 || true
+  claude plugin update taiga-kit@taiga-kit >/dev/null 2>&1 \
+    && echo "  плагин обновлён" \
+    || warn "  обновить не удалось — см. README, раздел про обновление"
+  echo "  ПЕРЕЗАПУСТИТЕ Claude Code: без этого останется старый навык."
 else
   echo "  подключаю каталог и ставлю плагин…"
   claude plugin marketplace add Sigmatick/taiga-kit >/dev/null 2>&1 \

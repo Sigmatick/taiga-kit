@@ -551,6 +551,127 @@ def cmd_attach(args):
     ok(f"вложено: {r.get('name')} · {r.get('size')} байт")
     ok(f"  {r.get('url','')}")
 
+def kbmb(n):
+    return f"{n/1048576:.1f} МБ" if n >= 1048576 else f"{max(n // 1024, 1)} КБ"
+
+def safe_name(n):
+    """Имя файла из трекера — чужой ввод. Срезаем путь целиком, чтобы
+    вложение не могло записаться мимо указанной папки."""
+    n = os.path.basename((n or "").replace("\\", "/")).strip() or "файл"
+    return re.sub(r'[\x00-\x1f<>:"|?*]', "_", n)[:120]
+
+def att_fetch(pid, kinds, since=None):
+    """Вложения проекта по родам карточек.
+
+    Запрос без object_id отдаёт сразу все вложения рода — восемь вызовов
+    на весь проект вместо одного на каждую карточку. Карточки тянем тем же
+    оптом: нужны номер и название, а они во вложении не лежат."""
+    out = {}
+    for k in kinds:
+        c, att = api("GET", f"/{KINDS[k][0]}/attachments?project={pid}", nopage=True)
+        if not att: continue
+        c, items = api("GET", f"/{KINDS[k][0]}?project={pid}", nopage=True)
+        by_id = {o["id"]: o for o in (items or [])}
+        for a in att:
+            if since and (a.get("created_date") or "")[:10] < since: continue
+            o = by_id.get(a.get("object_id"))
+            if not o: continue        # карточка удалена — вложение осиротело
+            out.setdefault((k, o["ref"], o.get("subject") or ""), []).append(a)
+    return {k: sorted(v, key=lambda x: x.get("order", 0)) for k, v in out.items()}
+
+def att_save(a, dest):
+    """Скачать одно вложение. Возвращает путь или None."""
+    u = a.get("url")
+    if not u: ok(f"  {a.get('name')}: нет ссылки — пропускаю"); return None
+    f = dest / safe_name(a.get("name"))
+    # Чужой файл молча не затираем: рядом ляжет копия с номером.
+    if f.exists():
+        n = 2
+        while (dest / f"{f.stem} ({n}){f.suffix}").exists(): n += 1
+        f = dest / f"{f.stem} ({n}){f.suffix}"
+    try:
+        # Ссылка подписана токеном, но заголовок всё равно шлём: анонимно
+        # Taiga отдаёт пустой ответ, а не ошибку, и «ноль файлов» выглядел
+        # бы как «вложений нет».
+        req = urllib.request.Request(u, headers={"Authorization": "Bearer " + tok()})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            f.write_bytes(r.read())
+    except Exception as e:
+        ok(f"  {a.get('name')}: не скачалось — {e}"); return None
+    return f
+
+def cmd_files(args):
+    """Вложения: показать и выгрузить — по одной карточке или оптом.
+
+    Ловушка Taiga: поле attachments на самом объекте ВСЕГДА пустое —
+    список отдаёт только /{род}/attachments. На этом в своё время
+    построился вывод «52 бага из 53 без вложений», а на деле вложения
+    были у 35 из 39."""
+    p = project(args); pid = p["id"]
+    if not args.ref and not args.all:
+        die("укажите номера карточек или --all")
+    if args.only and (args.all or len(args.ref) > 1):
+        die("--only работает только с одной карточкой")
+    kinds = [args.kind] if args.kind else list(KINDS)
+
+    if args.all:
+        groups = att_fetch(pid, kinds, args.since)
+    else:
+        groups = {}
+        for r in args.ref:
+            kind, o = find_item(pid, r, args.kind)
+            c, att = api("GET", f"/{KINDS[kind][0]}/attachments"
+                                f"?object_id={o['id']}&project={pid}")
+            att = sorted(att or [], key=lambda x: x.get("order", 0))
+            if args.since:
+                att = [a for a in att if (a.get("created_date") or "")[:10] >= args.since]
+            groups[(kind, o["ref"], o.get("subject") or "")] = att
+
+    c, us = api("GET", "/users")   # в записи вложения только числовой owner
+    names = {u["id"]: (u.get("full_name_display") or u.get("username") or "")
+             for u in (us or [])}
+    total = sum(len(v) for v in groups.values())
+    bytes_ = sum(a.get("size") or 0 for v in groups.values() for a in v)
+    if not total:
+        ok("вложений нет" + (f" (с {args.since})" if args.since else "")); return
+    for (kind, ref, subj), att in sorted(groups.items(), key=lambda x: x[0][1]):
+        if not att: continue
+        ok(f"{KINDS[kind][3]} #{ref} · {cut(subj, 60)}")
+        for i, a in enumerate(att, 1):
+            tail = " (из комментария)" if a.get("from_comment") else ""
+            ok(f"  {i:>2}. {a.get('name'):<44} {kbmb(a.get('size') or 0):>9}"
+               f"  {(a.get('created_date') or '')[:10]}  "
+               f"{names.get(a.get('owner'), '—')}{tail}")
+    ok(f"итого: {total} файлов, {kbmb(bytes_)}, карточек {len([1 for v in groups.values() if v])}")
+    if not args.get:
+        ok("  выгрузить: добавьте --get"); return
+
+    root = pathlib.Path(os.path.expanduser(args.to)) if args.to \
+           else reports_dir().parent / "вложения"
+    if args.only:
+        idx = {int(x) for x in re.split(r"[,\s]+", args.only) if x.isdigit()}
+        att0 = next(iter(groups.values()))
+        bad = idx - set(range(1, len(att0) + 1))
+        if bad: die(f"нет таких номеров: {', '.join(map(str, sorted(bad)))}")
+        groups = {k: [a for i, a in enumerate(v, 1) if i in idx]
+                  for k, v in groups.items()}
+        total = sum(len(v) for v in groups.values())
+        bytes_ = sum(a.get("size") or 0 for v in groups.values() for a in v)
+    # Выгрузка оптом может оказаться сотнями мегабайт — спрашиваем.
+    if total > 5 and not confirm(args, f"скачать {total} файлов ({kbmb(bytes_)}) в {root}"):
+        return
+    got, failed = 0, 0
+    for (kind, ref, subj), att in sorted(groups.items(), key=lambda x: x[0][1]):
+        if not att: continue
+        dest = root / f"{p['slug']}-{ref}" if (args.all or len(groups) > 1) else root
+        dest.mkdir(parents=True, exist_ok=True)
+        for a in att:
+            f = att_save(a, dest)
+            if f: got += 1; ok(f"  сохранено: {f}  ({kbmb(f.stat().st_size)})")
+            else: failed += 1
+    ok(f"выгружено файлов: {got} из {total}" + (f", не удалось {failed}" if failed else "")
+       + f"  →  {root}")
+
 def cmd_comment(args):
     p = project(args); kind, it = find_item(p["id"], args.ref, args.kind)
     c, h = api("GET", f"/history/{KINDS[kind][1]}/{it['id']}")
@@ -1800,6 +1921,7 @@ def inv_collect(projects):
                     "blocked": bool(o.get("is_blocked")),
                     "who": (o.get("assigned_to_extra_info") or {}).get("full_name_display") or "",
                     "uid": o.get("assigned_to"),
+                    "created": (o.get("created_date") or "")[:10],
                 })
     rows.sort(key=lambda x: (x["pr"], INV_ORDER.index(x["bucket"]) if x["bucket"] in INV_ORDER else 9, -x["ref"]))
     return rows
@@ -2028,14 +2150,446 @@ def cmd_inventory(args):
         ok(f"  отправлено файлом: {sent}")
     return out
 
+# ── утренняя рассылка по ролям ────────────────────────────────────────────
+# Один файл в день каждому, по его роли. Общая опись и текстовые сводки
+# убраны: человек тонул в чужом. Карточки на проверке исключены у всех,
+# кроме тестировщиков, — там ход не их.
+WORK_BUCKETS = ["Баги", "В процессе", "ToDo"]
+BUCKET_TYPE = {"Баги": "bug", "В процессе": "в работе", "ToDo": "todo"}
+AGE_BUCKETS = [("Пришло сегодня", 0, 0), ("На этой неделе", 1, 7),
+               ("Лежит дольше недели", 8, 30), ("Лежит больше месяца", 31, 99999)]
+
+def _url(r, base_url):
+    return f"{base_url}/project/{r['slug']}/{WEB_PATH[r['kind']]}/{r['ref']}"
+
+def _age(r, today):
+    import datetime
+    try: return (today - datetime.date.fromisoformat(r["created"])).days
+    except Exception: return 0
+
+def morn_dev(name, rows, uid, prev, prev_day, today, base_url):
+    """Разработчику, дизайнеру, админу, техписателю: только то, где ход за ним."""
+    import datetime
+    mine = [r for r in rows if r.get("uid") == uid and r["bucket"] in WORK_BUCKETS]
+    byp = {}
+    for r in mine: byp.setdefault(r["pr"], []).append(r)
+    L = [f"# Мои задачи — {datetime.date.fromisoformat(today):%d.%m.%Y}", "",
+         f"**{name}**", "",
+         f"Требуют вашего хода: **{len(mine)}**"
+         + (f" в {len(byp)} проектах" if byp else ""), "",
+         "_Карточки на проверке сюда не попадают: ход за тестировщиком._", ""]
+    for p in sorted(byp, key=lambda k: -len(byp[k])):
+        L += [f"## {p} — {len(byp[p])}", "",
+              "| Поставлена | Тип | № | Задача |", "|---|---|---|---|"]
+        for r in sorted(byp[p], key=lambda x: (x["created"], -x["ref"])):
+            ex = []
+            if r["due"]: ex.append(f"срок {r['due']}")
+            if r["blocked"]: ex.append("ЗАБЛОКИРОВАНА")
+            L.append(f"| {r['created']} | {BUCKET_TYPE.get(r['bucket'], '')} "
+                     f"| [#{r['ref']}]({_url(r, base_url)}) | {cut(r['subj'], 70)}"
+                     + (f" · {', '.join(ex)}" if ex else "") + " |")
+        L.append("")
+    if not mine: L += ["Ничего не ждёт вашего хода.", ""]
+    over = [r for r in mine if r["due"] and r["due"] < today]
+    blk = [r for r in mine if r["blocked"]]
+    L += ["## Требует внимания", ""]
+    if not (over or blk): L.append("Просроченных и заблокированных нет.")
+    for nm, rs in (("Просрочены", over), ("Заблокированы", blk)):
+        if not rs: continue
+        L.append(f"**{nm}: {len(rs)}**")
+        for r in rs: L.append(f"- {r['pr']} #{r['ref']} · {cut(r['subj'], 70)}")
+    if prev:
+        pk = {(r['slug'], r['kind'], r['ref']) for r in prev
+              if r.get('uid') == uid and r['bucket'] in WORK_BUCKETS}
+        nk = {(r['slug'], r['kind'], r['ref']) for r in mine}
+        L += ["", f"## Что нового за {prev_day}", "",
+              f"- новых у вас: **{len(nk - pk)}**", f"- ушло из списка: **{len(pk - nk)}**"]
+    return L
+
+def morn_qa(name, rows, slugs, prev, prev_day, today, base_url):
+    """Тестировщику: только колонка проверки, по проектам и по возрасту."""
+    import datetime, collections
+    td = datetime.date.fromisoformat(today)
+    rft = [r for r in rows if r["bucket"] == "Можно проверять"
+           and (not slugs or r["slug"] in slugs)]
+    byp = {}
+    for r in rft: byp.setdefault(r["pr"], []).append(r)
+    tot = collections.Counter()
+    for r in rft:
+        a = _age(r, td)
+        for nm, lo, hi in AGE_BUCKETS:
+            if lo <= a <= hi: tot[nm] += 1; break
+    L = [f"# На проверку — {td:%d.%m.%Y}", "", f"**{name}**", "",
+         f"В колонке «Ready for test»: **{len(rft)}**", ""]
+    if slugs: L += ["Ваши проекты: " + ", ".join(sorted(slugs)), ""]
+    if tot:
+        L += ["| Возраст | Карточек |", "|---|---:|"]
+        L += [f"| {nm} | {tot[nm]} |" for nm, _, _ in AGE_BUCKETS if tot[nm]]
+        L.append("")
+    for p in sorted(byp, key=lambda k: -len(byp[k])):
+        L += [f"## {p} — {len(byp[p])}", ""]
+        for nm, lo, hi in AGE_BUCKETS:
+            part = [r for r in byp[p] if lo <= _age(r, td) <= hi]
+            if not part: continue
+            L += [f"### {nm} — {len(part)}", "",
+                  "| Поставлена | Дней | № | Задача | От кого |", "|---|---:|---|---|---|"]
+            for r in sorted(part, key=lambda x: (x["created"], -x["ref"])):
+                L.append(f"| {r['created']} | {_age(r, td)} "
+                         f"| [#{r['ref']}]({_url(r, base_url)}) | {cut(r['subj'], 62)} "
+                         f"| {r['who'] or '—'} |")
+            L.append("")
+    if not rft: L += ["Очередь пуста.", ""]
+    if prev:
+        pk = {(r['slug'], r['kind'], r['ref']) for r in prev
+              if r["bucket"] == "Можно проверять" and (not slugs or r["slug"] in slugs)}
+        nk = {(r['slug'], r['kind'], r['ref']) for r in rft}
+        L += [f"## Что нового за {prev_day}", "",
+              f"- пришло на проверку: **{len(nk - pk)}**",
+              f"- ушло из очереди: **{len(pk - nk)}**",
+              f"- очередь: {len(pk)} → {len(nk)} ({len(nk) - len(pk):+d})"]
+    return L
+
+def morn_pm_text(name, rows, uid, projects_names, today):
+    """Руководителю — короткое напоминание в сообщении, без файла."""
+    import datetime
+    td = datetime.date.fromisoformat(today)
+    mine = [r for r in rows if r.get("uid") == uid and r["bucket"] in WORK_BUCKETS]
+    scope = [r for r in rows if not projects_names or r["pr"] in projects_names]
+    rft = [r for r in scope if r["bucket"] == "Можно проверять"]
+    bugs = [r for r in scope if r["bucket"] == "Баги"]
+    L = [f"Доброе утро, {name.split()[0]}. {td:%a %d.%m}", "",
+         "Сегодня: провести дейлик и заполнить карточку «Чек-статус» —",
+         "задачи в плане ссылками, имя участника как в Taiga.", ""]
+    if projects_names: L.append("Ваши проекты: " + ", ".join(sorted(projects_names)))
+    L += [f"🐞 Багов открыто: {len(bugs)}",
+          f"🧪 Ждут проверки: {len(rft)}"]
+    if mine:
+        L += ["", f"Лично на вас: {len(mine)}"]
+        for r in sorted(mine, key=lambda x: x["created"])[:5]:
+            L.append(f"  {r['pr']} #{r['ref']} · {cut(r['subj'], 56)}")
+        if len(mine) > 5: L.append(f"  …и ещё {len(mine) - 5}")
+    return "\n".join(L)
+
+def cmd_morning(args):
+    import datetime
+    if args.install or args.uninstall:
+        return simple_install("morning", ["morning", "--send"], args, 8, 30)
+    auth()
+    today = datetime.date.today().isoformat()
+    c, projects = api("GET", "/projects")
+    if projects == []: die("список проектов пуст при подтверждённой личности — подозрительно")
+    rows = inv_collect(projects)
+    prev_day, prev = inv_snap_prev(today)
+    rd = reports_dir(); rd.mkdir(parents=True, exist_ok=True)
+    rec = cfg_load().get("telegram_recipients", {})
+    subs = subs_load()
+    base_url = base()
+    sent = 0
+    for tid, v in rec.items():
+        who, chat = v["name"], int(v["chat_id"])
+        role = roster_role(who)
+        # Фамилии повторяются: два Пороха давали один файл, второй затирал
+        # первый. Добавляем идентификатор — он уникален всегда.
+        last = f"{roster_alias(who).split()[-1]}-{tid}"
+        if role == "pm":
+            rp = roster().get(roster_alias(who)) or {}
+            names = None if rp.get("all_projects") else \
+                    {p["name"] for p in projects if p["slug"] in (rp.get("projects") or [])}
+            txt = morn_pm_text(who, rows, int(tid), names, today)
+            if not args.dry:
+                r = tg_call("sendMessage", {"chat_id": chat, "text": txt})
+                sent += 1 if r.get("ok") else 0
+            ok(f"  {who:<22} напоминание о дейлике")
+            continue
+        if role == "qa":
+            sb = subs.get(str(chat)) or {}
+            slugs = set(sb.get("projects") or []) or set(
+                (roster().get(roster_alias(who)) or {}).get("projects") or [])
+            L = morn_qa(who, rows, slugs, prev, prev_day, today, base_url)
+            kind = "На_проверку"
+        else:
+            L = morn_dev(who, rows, int(tid), prev, prev_day, today, base_url)
+            kind = "Мои_задачи"
+        f = rd / f"{kind}_{today}_{last}.md"
+        f.write_text("\n".join(L) + "\n")
+        if not args.dry:
+            r = tg_document(chat, f, f"{kind.replace('_', ' ')} · {datetime.date.fromisoformat(today):%d.%m.%Y}")
+            sent += 1 if r.get("ok") else 0
+        ok(f"  {who:<22} {kind} · {f.name}")
+    if not args.dry: inv_snap_save(today, rows)
+    ok(f"разослано: {sent}")
+
+def simple_install(label, argv, args, dh, dm):
+    """Расписание на будни в одно время — общее для простых заданий."""
+    exe = str(pathlib.Path(sys.argv[0]).resolve())
+    at = getattr(args, "at", None) or f"{dh}:{dm:02d}"
+    hh, _, mm = at.partition(":")
+    if sys.platform != "darwin":
+        if args.uninstall: return cron_job(label, [], True)
+        return cron_job(label, [(f"{int(mm or 0)} {int(hh)} * * 1-5", argv)], False)
+    plist = HOME / "Library" / "LaunchAgents" / f"kz.taiga-kit.{label}.plist"
+    if args.uninstall:
+        subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+        if plist.exists(): plist.unlink()
+        ok(f"расписание снято: {plist}"); return
+    log = HOME / ".taiga-kit"; log.mkdir(parents=True, exist_ok=True)
+    days = "".join(f"    <dict><key>Weekday</key><integer>{d}</integer>"
+                   f"<key>Hour</key><integer>{int(hh)}</integer>"
+                   f"<key>Minute</key><integer>{int(mm or 0)}</integer></dict>\n" for d in range(1, 6))
+    xml = "".join(f"<string>{a}</string>" for a in argv)
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>kz.taiga-kit.{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{exe}</string>{xml}</array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{os.path.expanduser("~/.local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StartCalendarInterval</key>
+  <array>
+{days}  </array>
+  <key>StandardOutPath</key><string>{log}/{label}.log</string>
+  <key>StandardErrorPath</key><string>{log}/{label}.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+""")
+    subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+    r = subprocess.run(["launchctl", "load", str(plist)], capture_output=True, text=True)
+    if r.returncode: die(f"launchctl: {r.stderr.strip()}")
+    ok(f"расписание поставлено: будни {int(hh):02d}:{int(mm or 0):02d} · {plist}")
+
+def tmpl_norm(ln):
+    ln = ln.replace("\xa0", " ").replace("*", "").replace("#", "").replace("_", "")
+    ln = re.sub(r"^\s*\d+[.)]\s*", "", ln).replace("-", " ")
+    return re.sub(r"\s+", " ", ln).strip().lower()
+
+def daily_discipline(cards, scat, day, back=10):
+    """Проводят ли руководители дейлики. Проверяем не по ощущениям, а по
+    факту: за каждый рабочий день должна быть карточка «Чек-статус» и она
+    должна быть закрыта. Нет карточки — дейлика не было; есть, но открыта —
+    план на день не зафиксирован, сверять вечером не с чем."""
+    import datetime
+    days, d = [], day
+    while len(days) < back:
+        if d.weekday() < 5: days.append(d)
+        d -= datetime.timedelta(days=1)
+    days.reverse()
+    dset = set(days)
+    have, seen = {}, []             # ПМ → дата → (ref, закрыта ли)
+    for o in (cards or []):
+        m = CHECK_RE.match((o.get("subject") or "").strip())
+        if not m: continue
+        try: dd = datetime.date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError: continue
+        seen.append(dd)
+        if dd not in dset: continue
+        pm = roster_alias(m.group(4).strip())
+        have.setdefault(pm, {})[dd] = {"ref": o["ref"], "id": o["id"],
+                                       "closed": scat.get(o["status"], ("?", False))[1]}
+    # До первого дейлика в проекте спрашивать не с кого: ритуала ещё не было.
+    # Без этой отсечки каждому ПМ приписывались прогулы за дни,
+    # когда карточек не заводил никто.
+    if seen:
+        days = [d for d in days if d >= min(seen)]
+        if not days: return []
+    # Карточки заводятся автоматически, поэтому их наличие ничего не значит.
+    # Признак проведённого дейлика — заполненный план: блоки по участникам
+    # со ссылками на карточки. Пустая закрытая карточка — это не дейлик.
+    for h in have.values():
+        for d, v in h.items():
+            c, full = api("GET", f"/userstories/{v['id']}")
+            desc = (full or {}).get("description") or ""
+            parts = standup_parse(desc)
+            v["links"] = sum(len(p["links"]) for p in parts)
+            v["parts"] = len([p for p in parts if p["links"] or p["bare"] or p["body"]])
+            v["norm"] = " ".join(tmpl_norm(x) for x in desc.split("\n") if tmpl_norm(x))
+            # Руководитель может честно отметить, что созвона не было.
+            # Это не заполненный дейлик, но и не молчание — отдельный случай.
+            v["skip"] = bool(re.search(r"созвон\s+не\s+проводил|дейлик\s+не\s+проводил"
+                                       r"|не\s+проводился", v["norm"]))
+    # Нетронутый шаблон узнаём не по словам (их редактируют), а по совпадению:
+    # робот выдаёт всем один и тот же текст, поэтому описание, дословно
+    # повторяющееся у РАЗНЫХ руководителей, — это шаблон, а не работа.
+    # Так проверка переживает любую правку формулировок.
+    bytext = {}
+    for pm, h in have.items():
+        for v in h.values(): bytext.setdefault(v["norm"], set()).add(pm)
+    tmpl = {t for t, who in bytext.items() if len(who) > 1}
+    for h in have.values():
+        for v in h.values():
+            v["filled"] = (not v["skip"]
+                           and (bool(v["parts"])
+                                or (v["norm"] not in tmpl and len(v["norm"]) > 0)))
+    pms = sorted(set(have) | {k for k, v in roster().items() if v.get("role") == "pm"})
+    L = ["## Дейлики руководителей", "",
+         f"Рабочих дней в окне: {len(days)} ({days[0]:%d.%m} – {days[-1]:%d.%m}). "
+         "Карточки «Чек-статус» заводятся роботом, поэтому наличие карточки "
+         "ничего не доказывает — считается, что в неё написали. "
+         "**Со ссылками** — план можно сверить с фактом вечером. "
+         "**Без ссылок** — дейлик прошёл, но сверять нечего. "
+         "**Отмечен как несостоявшийся** — руководитель написал, что созвона не было. "
+         "**Карточка не тронута** — следов дейлика нет вовсе.", "",
+         "| Руководитель | Дейлик был | Со ссылками | Без ссылок | Отмечен как несостоявшийся "
+         "| Карточка не тронута | Карточка не закрыта | Задач в плане | Последний |",
+         "|---|---:|---:|---:|---:|---:|---:|---:|---|"]
+    misses = []
+    for pm in pms:
+        h = have.get(pm, {})
+        lk = [d for d in days if d in h and h[d]["links"]]
+        pr = [d for d in days if d in h and h[d]["filled"] and not h[d]["links"]]
+        sk = [d for d in days if d in h and h[d]["skip"]]
+        emp = [d for d in days if d not in h or not (h[d]["filled"] or h[d]["skip"])]
+        openc = [d for d in days if d in h and h[d]["filled"] and not h[d]["closed"]]
+        last = max(lk + pr) if (lk or pr) else None
+        L.append(f"| {pm} | {len(lk) + len(pr)} из {len(days)} | {len(lk)} | {len(pr)} "
+                 f"| {len(sk)} | {len(emp)} | {len(openc)} "
+                 f"| {sum(h[d]['links'] for d in days if d in h)} | "
+                 + (f"{last:%d.%m}" if last else "**ни одного**") + " |")
+        if emp: misses.append((pm, "карточка не тронута — следов дейлика нет", emp))
+        if sk: misses.append((pm, "отмечено, что созвон не проводился", sk))
+        if pr: misses.append((pm, "без ссылок — сверить план с фактом нечем", pr))
+        if openc: misses.append((pm, "карточка не закрыта", openc))
+    L.append("")
+    if misses:
+        L.append("**Пропуски**")
+        L.append("")
+        for pm, why, ds in misses:
+            L.append(f"- {pm} · {why}: " + ", ".join(f"{x:%d.%m}" for x in ds))
+        L.append("")
+    else:
+        L += ["Пропусков нет.", ""]
+    return L
+
+def ev_kind(e):
+    """Что произошло с карточкой: закрыли, отдали на проверку, вернули
+    в баги, взяли в работу. Всё прочее — перекладывание, не событие."""
+    t, f = e["to"].lower(), e["from"].lower()
+    if e["to_closed"] and not e["from_closed"]: return "закрыто"
+    if t == "ready for test" and f != "ready for test": return "на проверку"
+    if "bug" in t and "bug" not in f: return "в баги"
+    if "progress" in t and "progress" not in f: return "в работу"
+    return ""
+
+def pm_evening(name, events, planned, pnames, day, cache, slug2name, base_url,
+               extra=None, ttl=None, week=False):
+    """План против факта по ПРОЕКТАМ — то, что нужно руководителю вечером.
+
+    Колонка «было в плане» отвечает на единственный вопрос дня: делали ли
+    то, о чём договорились утром. Без неё отчёт показывает активность,
+    но не дисциплину."""
+    inplan = lambda e: (str(e["slug"]).lower(), e["kind"], e["ref"]) in planned
+    # Перекладывание внутри бэклога работой не считаем: в отчёте остаются
+    # четыре события, которые меняют состояние дела. Одна карточка —
+    # одна строка на каждое такое событие, повторы схлопываем.
+    # За день карточка может дать несколько событий — показываем каждое.
+    # За неделю их набегают сотни, и читать это невозможно: там карточка
+    # сворачивается в одну строку с итогом недели.
+    sig, last = {}, {}
+    for e in sorted(events, key=lambda z: z["at"]):
+        t = ev_kind(e)
+        if not t: continue
+        k = (str(e["slug"]).lower(), e["kind"], e["ref"])
+        sig[k + (t,)] = e        # для счётчиков: каждое событие по разу
+        last[k] = e              # для таблицы за неделю: итог карточки
+    cnts = sorted(sig.values(), key=lambda z: z["at"])
+    keep = sorted((last if week else sig).values(), key=lambda z: z["at"])
+    byproj = {}
+    for e in cnts:
+        if pnames is not None and e["project"] not in pnames: continue
+        byproj.setdefault(e["project"], {"ev": [], "cnt": [], "miss": []})["cnt"].append(e)
+    for e in keep:
+        if pnames is not None and e["project"] not in pnames: continue
+        byproj.setdefault(e["project"], {"ev": [], "cnt": [], "miss": []})["ev"].append(e)
+    touched = {(str(e["slug"]).lower(), e["kind"], e["ref"]) for e in cnts}
+    for g in sorted(planned):
+        if g in touched: continue
+        it = standup_lookup(g[0], g[1], g[2], cache)
+        pn = (it or {}).get("project") or slug2name.get(g[0], g[0])
+        if pnames is not None and pn not in pnames: continue
+        byproj.setdefault(pn, {"ev": [], "cnt": [], "miss": []})["miss"].append((g, it))
+
+    allev = [e for d in byproj.values() for e in d["cnt"]]
+    tot_cl = len([e for e in allev if e["to_closed"] and not e["from_closed"]])
+    tot_pl = len([e for e in allev if inplan(e)])
+    L = [("# План против факта за неделю — " if week else "# План против факта — ")
+         + (ttl or f"{day:%d.%m.%Y}"), "",
+         f"**{name}** · " + (", ".join(sorted(pnames)) if pnames else "все проекты"), "",
+         f"В плане {'на неделю' if week else 'на день'}: **{len(planned)}** "
+         f"· движений: **{len(allev)}** "
+         f"(из них по плану **{tot_pl}**) · закрыто: **{tot_cl}**", ""]
+    if not byproj:
+        return L + ["_Движения не было._", ""]
+    L += ["## Коротко по проектам", "",
+          "| Проект | Закрыто | На проверку | В баги | В работу | Всего | Из них в плане | Не двигалось |",
+          "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for pn in sorted(byproj):
+        ev, miss = byproj[pn]["cnt"], byproj[pn]["miss"]
+        g = lambda k: len([e for e in ev if ev_kind(e) == k])
+        L.append(f"| {pn} | {g('закрыто')} | {g('на проверку')} | {g('в баги')} "
+                 f"| {g('в работу')} | {len(ev)} | {len([e for e in ev if inplan(e)])} "
+                 f"| {len(miss)} |")
+    tot = [e for d in byproj.values() for e in d["cnt"]]
+    tm = sum(len(d["miss"]) for d in byproj.values())
+    gt = lambda k: len([e for e in tot if ev_kind(e) == k])
+    L += [f"| **Итого** | **{gt('закрыто')}** | **{gt('на проверку')}** | **{gt('в баги')}** "
+          f"| **{gt('в работу')}** | **{len(tot)}** | **{len([e for e in tot if inplan(e)])}** "
+          f"| **{tm}** |", ""]
+    if extra: L += extra
+    for pn in sorted(byproj):
+        ev, cn, miss = byproj[pn]["ev"], byproj[pn]["cnt"], byproj[pn]["miss"]
+        cl = [e for e in cn if ev_kind(e) == "закрыто"]
+        tt = [e for e in cn if ev_kind(e) == "на проверку"]
+        bk = [e for e in cn if ev_kind(e) == "в баги"]
+        tk = [e for e in cn if ev_kind(e) == "в работу"]
+        L += [f"## {pn}", "", "| | Всего | Было в плане |", "|---|---:|---:|"]
+        for lbl, g in (("Закрыто", cl), ("Ушло на проверку", tt),
+                       ("Вернули в баги", bk), ("Взято в работу", tk)):
+            L.append(f"| {lbl} | {len(g)} | {len([e for e in g if inplan(e)])} |")
+        L.append("")
+        if ev:
+            if week:
+                # Счётчики выше считают все переходы, таблица — карточки.
+                # Без этой оговорки расхождение выглядит как ошибка.
+                L += ["_Каждая карточка — одной строкой, по последнему событию "
+                      "недели. В счётчиках выше учтены все переходы, поэтому "
+                      "числа могут быть больше._", ""]
+            L += [("| Дата | Что | № | Задача | Кто | В плане |" if week else
+                   "| Время | Что | № | Задача | Кто | В плане |"),
+                  "|---|---|---|---|---|---|"]
+            for e in sorted(ev, key=lambda z: z["at"]):
+                dt = f"{e['at'][8:10]}.{e['at'][5:7]}" if week else e["at"][11:16]
+                L.append(f"| {dt}"
+                         f" | {ev_kind(e)} "
+                         f"| [#{e['ref']}]({base_url}/project/{e['slug']}/"
+                         f"{WEB_PATH[e['kind']]}/{e['ref']}) | {cut(e['subject'], 56)} "
+                         f"| {e['who']} | {'да' if inplan(e) else '—'} |")
+            L.append("")
+        if miss:
+            L += [f"**Было в плане, но не двигалось: {len(miss)}**", "",
+                  "| № | Задача | Сейчас |", "|---|---|---|"]
+            for g, it in miss:
+                L.append(f"| [#{g[2]}]({base_url}/project/{g[0]}/{WEB_PATH[g[1]]}/{g[2]}) "
+                         f"| {cut((it or {}).get('subject') or '—', 56)} "
+                         f"| {(it or {}).get('status') or '?'} |")
+            L.append("")
+    return L
+
 def cmd_standup(args):
     import datetime
     if args.install or args.uninstall: return standup_install(args)
     auth()
     TZ = datetime.datetime.now().astimezone().tzinfo
     day = datetime.date.fromisoformat(args.day) if args.day else datetime.datetime.now(TZ).date()
-    start_l = datetime.datetime(day.year, day.month, day.day, tzinfo=TZ)
-    end_l = start_l + datetime.timedelta(days=1)
+    # Недельный свод закрывает неделю целиком: понедельник — пятница.
+    # Если неделя ещё не кончилась, окно обрывается на сегодня, чтобы
+    # отчёт не делал вид, будто знает про будущие дни.
+    first = day - datetime.timedelta(days=day.weekday()) if args.week else day
+    last = min(day, first + datetime.timedelta(days=4)) if args.week else day
+    start_l = datetime.datetime(first.year, first.month, first.day, tzinfo=TZ)
+    end_l = (datetime.datetime(last.year, last.month, last.day, tzinfo=TZ)
+             + datetime.timedelta(days=1))
     start, end = start_l.astimezone(datetime.timezone.utc), end_l.astimezone(datetime.timezone.utc)
     slug = args.pm_project or cfg_load().get("standup_project", STANDUP_PROJECT)
 
@@ -2047,12 +2601,13 @@ def cmd_standup(args):
     c, cards = api("GET", f"/userstories?project={pid}", nopage=True)
     if cards == []: die("в проекте руководителей пусто при подтверждённой личности — подозрительно")
 
-    want = f"{day:%d}.{day:%m}.{day:%Y}"
+    want = {f"{first + datetime.timedelta(days=i):%d.%m.%Y}"
+            for i in range((last - first).days + 1)}
     todays = []
     for o in (cards or []):
         m = CHECK_RE.match((o.get("subject") or "").strip())
         if not m: continue
-        if f"{m.group(1)}.{m.group(2)}.{m.group(3)}" != want: continue
+        if f"{m.group(1)}.{m.group(2)}.{m.group(3)}" not in want: continue
         c2, full = api("GET", f"/userstories/{o['id']}")
         todays.append({"ref": o["ref"], "pm": m.group(4).strip(),
                        "status": scat.get(o["status"], ("?", False))[0],
@@ -2116,13 +2671,16 @@ def cmd_standup(args):
                          "empty": not p["links"] and not p["bare"] and not p["body"],
                          "prose": not p["links"] and not p["bare"] and bool(p["body"])})
         blocks.append({"pm": t["pm"], "ref": t["ref"], "status": t["status"],
-                       "rows": rows, "probs": probs})
+                       "rows": rows, "probs": probs,
+                       "plan": {g for p in parts for g in p["links"]}})
 
-    L = [f"# План против факта · {day:%d.%m.%Y}", "",
+    ttl = (f"{first:%d.%m} – {last:%d.%m.%Y}" if args.week else f"{day:%d.%m.%Y}")
+    L = [(f"# План против факта за неделю · {ttl}" if args.week
+          else f"# План против факта · {ttl}"), "",
          f"Сформировано {datetime.datetime.now(TZ):%H:%M} · план — из карточек «Чек-статус» "
          f"проекта {pr.get('name') or slug}, факт — из журнала переходов.", ""]
     if not todays:
-        L += [f"**Карточек «Чек-статус» на {day:%d.%m.%Y} не нашлось.**", "",
+        L += [f"**Карточек «Чек-статус» на {ttl} не нашлось.**", "",
               "Либо дейлики не заводились, либо названия отличаются от "
               "`Чек-статус <дн> ДД.ММ.ГГГГ — <ПМ>`."]
     for b in blocks:
@@ -2185,7 +2743,8 @@ def cmd_standup(args):
     snotes = support_notes(scards, start, end)
     L += [""] + support_block(snotes, scards)
     rd = reports_dir(); rd.mkdir(parents=True, exist_ok=True)
-    out = rd / f"План-факт_{day:%Y-%m-%d}.md"
+    out = rd / (f"План-факт_неделя_{first:%Y-%m-%d}.md" if args.week
+                else f"План-факт_{day:%Y-%m-%d}.md")
     out.write_text("\n".join(L) + "\n")
     ok(str(out))
     for b in blocks:
@@ -2195,49 +2754,53 @@ def cmd_standup(args):
         ok(f"  {b['pm']:<22} в плане {tot:>3}, закрыто {dn:>3}, сверх плана {ex:>3}"
            + ("  ⚠ " + "; ".join(b["probs"]) if b["probs"] else ""))
     if not blocks: ok("  карточек на этот день нет")
-    if args.send:
-        # Полный отчёт в сообщение не влезает: лимит Telegram 4096 знаков,
-        # а файл по всем проектам в разы длиннее. Поэтому текст — выжимкой,
-        # а сам отчёт файлом тем, кто выбрал вечерний режим.
-        sent_doc = 0
-        for cid, sb in subs_load().items():
-            if not sb.get("evening"): continue
-            r = tg_document(int(cid), out,
-                            f"Отчёт за {day:%d.%m.%Y} — план против факта, тестирование, "
-                            f"недельный план, операционка")
-            if r.get("ok"): sent_doc += 1
-            else: ok(f"  файл → {sb.get('name') or cid}: ОШИБКА {r.get('description')}")
-        if sent_doc: ok(f"  отчёт файлом отправлен: {sent_doc}")
-        q = tqueue
+    if args.send or args.dry:
+        # Вечером отчёт нужен только руководителям: ПМ по своим проектам,
+        # CTO по всем. Разработчикам и тестерам вечерняя рассылка отменена —
+        # у них утренний файл. Текстом свод не влезает (лимит 4096), поэтому
+        # каждому собирается свой файл.
         slug2name = {p["slug"]: p["name"] for p in (projects or [])}
-        subs = subs_load()
+        burl = base()
+        plan_all = set().union(*[b["plan"] for b in blocks]) if blocks else set()
         rec = cfg_load().get("telegram_recipients", {})
-        for b in blocks:
-            tgt = next((v for v in rec.values() if b["pm"].lower() in (v.get("name") or "").lower()
-                        or (v.get("name") or "").lower() in b["pm"].lower()), None)
-            if not tgt: ok(f"  {b['pm']}: нет связанного чата — не отправлено"); continue
-            # Человек мог отметить себе проекты в боте — тогда тестирование
-            # показываем только по ним. Не отмечал — показываем всё.
-            # Проекты руководителя берём из карты команды: он отвечает
-            # за свои, и статистика по чужим ему только мешает. Карта
-            # главнее галочек в боте — она описывает устройство отдела,
-            # а не предпочтения. Кому положено видеть всё — видит всё.
-            rp = roster().get(roster_alias(b["pm"])) or {}
-            only = None
-            if not rp.get("all_projects"):
-                if rp.get("projects"):
-                    only = {slug2name.get(x, x) for x in rp["projects"]}
-                else:
-                    sb = subs.get(str(tgt["chat_id"]))
-                    if sb is not None and sb.get("evening"):
-                        only = {slug2name.get(x, x) for x in (sb.get("projects") or [])}
-            r = tg_call("sendMessage", {"chat_id": tgt["chat_id"],
-                                        "text": standup_tg(b, day) + "\n"
-                                                + "\n".join(test_tg(events, q, only))
-                                                + "\n".join(week_tg(goals, daily_refs, cache))
-                                                + "\n".join(support_tg(snotes)),
-                                        "disable_web_page_preview": True})
-            ok(f"  {b['pm']}: {'отправлено' if r.get('ok') else 'ОШИБКА ' + str(r.get('description'))}")
+        rd2 = reports_dir(); sent = 0
+        for v in rec.values():
+            nm = v.get("name") or ""
+            who = roster_alias(nm)
+            rp = roster().get(who) or {}
+            if rp.get("role") not in ("pm", "cto"):
+                continue
+            if rp.get("all_projects"):
+                pnames, planned = None, plan_all
+            else:
+                pnames = {slug2name.get(x, x) for x in (rp.get("projects") or [])} or None
+                planned = set().union(*[b["plan"] for b in blocks
+                                        if roster_alias(b["pm"]) == who]) or set()
+            # Дисциплина дейликов — вопрос руководителя всего отдела,
+            # а не ПМ про самого себя.
+            back = (last - first).days + 1 if args.week else 10
+            ex = (daily_discipline(cards, scat, last, back)
+                  if rp.get("role") == "cto" else None)
+            L2 = pm_evening(who, events, planned, pnames, day, cache, slug2name, burl,
+                            ex, ttl, args.week)
+            f2 = rd2 / ((f"План-факт_неделя_{first:%Y-%m-%d}_{who.split()[-1]}.md"
+                         if args.week else
+                         f"План-факт_{day:%Y-%m-%d}_{who.split()[-1]}.md"))
+            f2.write_text("\n".join(L2) + "\n")
+            if args.dry: ok(f"  {who}: {f2}"); continue
+            r = tg_document(int(v["chat_id"]), f2,
+                            ("План против факта за неделю — " if args.week
+                             else "План против факта — ") + ttl)
+            if r.get("ok"): sent += 1; ok(f"  {who}: отправлено ({f2.name})")
+            else: ok(f"  {who}: ОШИБКА {r.get('description')}")
+        if not args.dry: ok(f"  вечерний свод получили: {sent}")
+        # В пятницу к дневному своду добавляется недельный. Отдельного
+        # расписания не заводим: меньше мест, где может молча не сработать.
+        if not args.week and day.weekday() == 4:
+            import copy
+            a2 = copy.copy(args); a2.week = True
+            ok("— недельный свод —")
+            cmd_standup(a2)
     return out
 
 def move_chain(ev, fallback=""):
@@ -4414,6 +4977,9 @@ def main():
     su.add_argument("--only", metavar="ИМЯ", help="только по одному руководителю")
     su.add_argument("--pm-project", metavar="СЛАГ", help="проект с карточками дейликов")
     su.add_argument("--send", action="store_true", help="разослать руководителям в Telegram")
+    su.add_argument("--dry", action="store_true", help="собрать файлы руководителей, но не отправлять")
+    su.add_argument("--week", action="store_true",
+                    help="свод за неделю понедельник–пятница вместо одного дня")
     su.add_argument("--install", action="store_true", help="расписание: будни 19:00")
     su.add_argument("--uninstall", action="store_true")
     su.add_argument("--at", default="19:00", metavar="ЧЧ:ММ", help="время запуска")
@@ -4450,6 +5016,13 @@ def main():
     rc.add_argument("--start", default="9", metavar="Ч")
     rc.add_argument("--end", default="19", metavar="Ч")
     rc.set_defaults(fn=cmd_recon)
+    mo = P("morning")
+    mo.add_argument("--send", action="store_true", help="разослать; без него только файлы")
+    mo.add_argument("--dry", action="store_true", help="не слать и не сохранять снимок")
+    mo.add_argument("--install", action="store_true", help="расписание: будни 08:30")
+    mo.add_argument("--uninstall", action="store_true")
+    mo.add_argument("--at", default="8:30", metavar="ЧЧ:ММ")
+    mo.set_defaults(fn=cmd_morning)
     iv = P("inventory")
     iv.add_argument("--send", action="store_true", help="разослать файлом руководителям")
     iv.add_argument("--dry", action="store_true", help="не сохранять снимок")
@@ -4492,6 +5065,13 @@ def main():
     at = P("attach"); at.add_argument("ref"); at.add_argument("file")
     at.add_argument("--desc", help="подпись к вложению")
     at.set_defaults(fn=cmd_attach)
+    fl = P("files"); fl.add_argument("ref", nargs="*", help="номера карточек")
+    fl.add_argument("--all", action="store_true", help="все вложения проекта")
+    fl.add_argument("--since", metavar="ГГГГ-ММ-ДД", help="вложенные не раньше этой даты")
+    fl.add_argument("--get", action="store_true", help="скачать вложения, а не только показать")
+    fl.add_argument("--only", metavar="N,N", help="номера из списка (одна карточка)")
+    fl.add_argument("--to", metavar="ПАПКА", help="куда сохранить")
+    fl.set_defaults(fn=cmd_files)
     cm = P("comment"); cm.add_argument("ref"); cm.add_argument("text"); cm.add_argument("--force", action="store_true"); cm.set_defaults(fn=cmd_comment)
     args = ap.parse_args(); args.fn(args)
 
