@@ -2171,12 +2171,17 @@ def morn_dev(name, rows, uid, prev, prev_day, today, base_url):
     """Разработчику, дизайнеру, админу, техписателю: только то, где ход за ним."""
     import datetime
     mine = [r for r in rows if r.get("uid") == uid and r["bucket"] in WORK_BUCKETS]
+    # Своё на проверке — одной цифрой, без разбора. Что именно там лежит,
+    # разработчику не нужно: ход не за ним. Нужно знать, сколько ждёт.
+    ontest = len([r for r in rows if r.get("uid") == uid
+                  and r["bucket"] == "Можно проверять"])
     byp = {}
     for r in mine: byp.setdefault(r["pr"], []).append(r)
     L = [f"# Мои задачи — {datetime.date.fromisoformat(today):%d.%m.%Y}", "",
          f"**{name}**", "",
          f"Требуют вашего хода: **{len(mine)}**"
-         + (f" в {len(byp)} проектах" if byp else ""), "",
+         + (f" в {len(byp)} проектах" if byp else "")
+         + f" · на проверке у тестировщиков: **{ontest}**", "",
          "_Карточки на проверке сюда не попадают: ход за тестировщиком._", ""]
     for p in sorted(byp, key=lambda k: -len(byp[k])):
         L += [f"## {p} — {len(byp[p])}", "",
