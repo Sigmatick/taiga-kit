@@ -882,6 +882,62 @@ def add_members(pid, names, role_name, args):
             ok(f"  ! {u['full_name_display']} → {r}")
     return n
 
+ROSTER_ROLE = {"qa": "QA", "design": "Design", "pm": "PM", "devops": "Devops",
+               "writer": "TechWriter", "admin": "admin", "support": "QA"}
+
+def cmd_member(args):
+    """Участники проекта: показать и добавить.
+
+    Кнопка «добавить участника» в веб-интерфейсе бьёт в
+    `memberships/bulk_create`, и на нашем сервере он отвечает 500 на любого
+    живого человека в любом проекте. Одиночный POST /memberships работает —
+    им и добавляем, поэтому через кит человека завести можно даже тогда,
+    когда интерфейс этого не даёт."""
+    p = project(args); pid = p["id"]
+    c, roles = api("GET", f"/roles?project={pid}")
+    if not args.who:
+        c, ms = api("GET", f"/memberships?project={pid}", nopage=True)
+        ok(f"участники «{p['name']}»: {len(ms or [])}")
+        for x in sorted(ms or [], key=lambda z: (z.get("full_name") or "")):
+            mark = "" if x.get("user") else "   ПРИГЛАШЁН, ещё не принял"
+            ok(f"  {str(x.get('full_name') or x.get('email') or '—'):<26} "
+               f"роль: {x.get('role_name')}{mark}")
+        ok("\nроли проекта: " + ", ".join(r["name"] for r in (roles or [])))
+        ok("добавить:  taiga member \"Фамилия\" --role Design")
+        return
+    # Человека ищем ДО разбора роли: иначе на опечатку в фамилии приходил
+    # ответ «не указана роль», и искали не там.
+    c, all_users = api("GET", "/users")
+    hit = [u for u in (all_users or [])
+           if args.who.lower() in (u.get("full_name_display") or "").lower()
+           or args.who.lower() == (u.get("username") or "").lower()]
+    if not hit: die(f"«{args.who}» не найден среди людей инстанса — см. `taiga users`")
+    if len(hit) > 1:
+        die(f"«{args.who}» подходит нескольким: "
+            + ", ".join(u["full_name_display"] for u in hit))
+    who = hit[0]
+    c, ms = api("GET", f"/memberships?project={pid}", nopage=True)
+    cur = next((x for x in (ms or []) if x.get("user") == who["id"]), None)
+    if cur:
+        ok(f"{who['full_name_display']} уже в проекте, роль: {cur.get('role_name')}")
+        return
+    role = args.role
+    if not role:
+        # Роль можно не называть, если человек есть в карте команды и его
+        # должность отображается в роль однозначно. «dev» не отображается:
+        # Front, Back и Mobile — разные роли, и угадывать тут нельзя.
+        rp = roster().get(roster_alias(who["full_name_display"])) or {}
+        role = ROSTER_ROLE.get(rp.get("role") or "")
+        if not role:
+            why = (f"в карте команды он «{rp['role']}», а это не одна роль проекта"
+                   if rp.get("role") else "его нет в карте команды")
+            die(f"для «{who['full_name_display']}» роль не вывести: {why}. "
+                f"Укажите --role. Роли проекта: "
+                + ", ".join(r["name"] for r in (roles or [])))
+        ok(f"роль не указана, беру из карты команды: {role}")
+    n = add_members(pid, [args.who], role, args)
+    if n: ok(f"добавлено: {n}")
+
 def cmd_new_project(args):
     auth()
     if not args.desc: die("описание обязательно: Taiga отвечает 400 без него")
@@ -5070,6 +5126,10 @@ def main():
     at = P("attach"); at.add_argument("ref"); at.add_argument("file")
     at.add_argument("--desc", help="подпись к вложению")
     at.set_defaults(fn=cmd_attach)
+    mb = P("member")
+    mb.add_argument("who", nargs="?", metavar="КТО", help="фамилия или логин; пусто — показать состав")
+    mb.add_argument("--role", metavar="РОЛЬ", help="роль в проекте; без неё берётся из карты команды")
+    mb.set_defaults(fn=cmd_member)
     fl = P("files"); fl.add_argument("ref", nargs="*", help="номера карточек")
     fl.add_argument("--all", action="store_true", help="все вложения проекта")
     fl.add_argument("--since", metavar="ГГГГ-ММ-ДД", help="вложенные не раньше этой даты")
