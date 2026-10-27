@@ -3509,7 +3509,10 @@ def tg_tap(q, slugs, names):
     tg_call("editMessageText", {"chat_id": cid, "message_id": mid, "text": head,
                                 "reply_markup": kb})
 
-TG_BEAT = HOME / ".taiga-kit" / "tgserve.beat"
+TG_BEAT = HOME / ".taiga-kit" / "tgserve.beat"   # процесс крутится
+TG_OK   = HOME / ".taiga-kit" / "tgserve.ok"     # последний УДАЧНЫЙ опрос
+TG_ERR  = HOME / ".taiga-kit" / "tgserve.err"    # и последняя ошибка
+TG_WD_STATE = HOME / ".taiga-kit" / "tgserve.watchdog.json"
 
 def tg_busy():
     """Слушатель жив? Telegram разрешает только один getUpdates на бота:
@@ -3517,6 +3520,33 @@ def tg_busy():
     должен уступать постоянному слушателю, а не драться с ним."""
     try: return time.time() - TG_BEAT.stat().st_mtime < 180
     except Exception: return False
+
+def tg_health():
+    """Состояние слушателя: крутится ли процесс и читает ли он на самом деле.
+
+    Это разные вещи, и разница однажды стоила двух потерянных заявок
+    на связку. Отметка «жив» ставилась ДО опроса и независимо от исхода,
+    поэтому процесс, час подряд получавший Conflict, выглядел исправным:
+    снаружи это неотличимо от «боту просто никто не писал»."""
+    now = time.time()
+    age = lambda p: (now - p.stat().st_mtime) if p.exists() else None
+    h = {"процесс": age(TG_BEAT), "чтение": age(TG_OK),
+         "ошибка": (TG_ERR.read_text().strip()[:200] if TG_ERR.exists() else "")}
+    # Длинный опрос висит до 50 секунд, успешный возврат бывает раз в минуту.
+    # Пятнадцать минут тишины — это уже не задержка, а поломка.
+    h["жив"] = h["процесс"] is not None and h["процесс"] < 180
+    h["читает"] = h["чтение"] is not None and h["чтение"] < 900
+    h["беда"] = (not h["жив"]) or (not h["читает"])
+    if not h["жив"]: h["что"] = "слушатель бота не запущен или завис"
+    elif not h["читает"]: h["что"] = "слушатель крутится, но обновления не читаются"
+    else: h["что"] = ""
+    return h
+
+def tg_health_line(h):
+    f = lambda v: "никогда" if v is None else (
+        f"{int(v)} с назад" if v < 120 else f"{int(v//60)} мин назад")
+    return (f"процесс: {f(h['процесс'])} · удачное чтение: {f(h['чтение'])}"
+            + (f" · последняя ошибка: {h['ошибка']}" if h["ошибка"] else ""))
 
 # ── привязка чата к учётной записи: человек выбирает, админ подтверждает ───
 # Автоматом по имени нельзя: «Mikhail S.» и «Михаил Степанов» не совпадут,
@@ -3631,6 +3661,13 @@ def tg_serve(args):
             TG_BEAT.parent.mkdir(parents=True, exist_ok=True)
             TG_BEAT.touch()
             n, err = tg_poll(long=True)
+            # Отметку об успехе ставим ТОЛЬКО после удачного ответа: иначе
+            # вечно падающий цикл выглядит здоровым, и поломку никто не видит.
+            if not err:
+                TG_OK.touch()
+                if TG_ERR.exists(): TG_ERR.unlink()
+            else:
+                TG_ERR.write_text(str(err)[:200])
             if err:
                 if "Conflict" in str(err):
                     print("telegram: кто-то ещё опрашивает бота — обновления "
@@ -3807,6 +3844,16 @@ def tgpoll_install(args):
 
 def cmd_telegram(args):
     if args.install or args.uninstall: return tgpoll_install(args)
+    if args.health:
+        h = tg_health()
+        ok("слушатель бота: " + ("РАБОТАЕТ" if not h["беда"] else "НЕ РАБОТАЕТ"))
+        ok("  " + tg_health_line(h))
+        if h["беда"]:
+            ok(f"  {h['что']}")
+            ok("  пока он молчит, нажатия кнопок и новые Start теряются:")
+            ok("  Telegram хранит непрочитанное около суток")
+            ok("  перезапуск: launchctl kickstart -k gui/$(id -u)/kz.taiga-kit.tgpoll")
+        return
     if args.serve: return tg_serve(args)
     if args.poll:
         if tg_busy():
@@ -4347,6 +4394,44 @@ def notify_columns(args, seen):
         notify_save(seen)
     return sent
 
+def tg_watchdog(args):
+    """Сторож слушателя бота. Вешается на `notify`: он и так ходит четырежды
+    в час с той же машины, отдельное задание было бы ещё одним местом,
+    где всё может тихо встать.
+
+    Молчащий слушатель снаружи неотличим от «боту никто не писал»: именно
+    так однажды пропали две заявки на связку, и заметили это через неделю.
+    Отправка при этом работает, даже когда чтение сломано, — проверено,
+    так что тревога дойдёт."""
+    import datetime as _dt
+    h = tg_health()
+    st = {}
+    if TG_WD_STATE.is_file():
+        try: st = json.loads(TG_WD_STATE.read_text())
+        except json.JSONDecodeError: st = {}
+    today = _dt.date.today().isoformat()
+    if not h["беда"]:
+        if st.get("fails"):
+            ok(f"  слушатель бота снова читает (подряд неудачных проверок: {st['fails']})")
+        TG_WD_STATE.write_text(json.dumps({}))
+        return
+    # Две проверки подряд — это 15–30 минут. Одиночный сбой сети тревоги
+    # не стоит, а вот полчаса молчания означают потерянные обращения.
+    st["fails"] = int(st.get("fails", 0)) + 1
+    msg = (f"⚠ Опрос бота не работает: {h['что']}.\n{tg_health_line(h)}\n\n"
+           f"Пока он молчит, нажатия кнопок и новые Start теряются "
+           f"безвозвратно: Telegram хранит непрочитанное около суток.\n"
+           f"Перезапустить: launchctl kickstart -k gui/$(id -u)/kz.taiga-kit.tgpoll")
+    if st["fails"] >= 2 and st.get("alerted") != today and not args.dry:
+        st["alerted"] = today
+        notify("Taiga: опрос бота встал", h["что"])
+        cid = admin_chat()
+        if cid: tg_call("sendMessage", {"chat_id": cid, "text": msg})
+        ok("  о поломке слушателя сообщено: уведомление и Telegram")
+    else:
+        ok(f"  ⚠ {h['что']} ({tg_health_line(h)})")
+    TG_WD_STATE.write_text(json.dumps(st))
+
 def cmd_notify(args):
     if args.install or args.uninstall: return notify_install(args)
     if args.column:
@@ -4378,6 +4463,7 @@ def cmd_notify(args):
            f"список администратора пуст, получатели только из самоподписки (сейчас их {n})"))
         return
     auth()
+    tg_watchdog(args)
     rec = cfg_load().get("telegram_recipients", {})
     if not rec: die("получателей нет — см. `taiga telegram --discover`")
     want = {s.lower() for s in cfg_load().get("watch_statuses", ["BUG","Bug (reopen)","ToDo"])}
@@ -5243,6 +5329,7 @@ def main():
     tg.add_argument("--test", action="store_true", help="отправить всем проверочное сообщение")
     tg.add_argument("--poll", action="store_true", help="разобрать накопившееся и выйти")
     tg.add_argument("--serve", action="store_true", help="слушать бота постоянно (длинный опрос)")
+    tg.add_argument("--health", action="store_true", help="работает ли опрос бота на самом деле")
     tg.add_argument("--install", action="store_true", help="частый опрос бота (ради кнопок)")
     tg.add_argument("--uninstall", action="store_true")
     tg.add_argument("--every-sec", default="120", metavar="СЕК", help="период опроса, по умолчанию 120")

@@ -263,7 +263,7 @@ taiga morning [--dry] [--only ИМЯ] [--install [--at ЧЧ:ММ]|--uninstall]
                           утренняя рассылка: каждому своё, по роли
 taiga notify [--baseline|--dry] [--max N] [--install [--every Ч --start Ч --end Ч]|--uninstall]
                           адресно: «вам назначена карточка» в BUG/ToDo
-taiga telegram [--discover|--add ИМЯ CHAT_ID|--test]
+taiga telegram [--discover|--add ИМЯ CHAT_ID|--test|--health]
                           рассылка сводок в Telegram
 taiga watch [--dry] [--days N] [--install|--uninstall]
        [--every Ч] [--start Ч] [--end Ч] [--all-days]   период опроса
