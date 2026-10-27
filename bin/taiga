@@ -1978,6 +1978,7 @@ def inv_collect(projects):
                     "who": (o.get("assigned_to_extra_info") or {}).get("full_name_display") or "",
                     "uid": o.get("assigned_to"),
                     "created": (o.get("created_date") or "")[:10],
+                    "touched": (o.get("modified_date") or "")[:10],
                 })
     rows.sort(key=lambda x: (x["pr"], INV_ORDER.index(x["bucket"]) if x["bucket"] in INV_ORDER else 9, -x["ref"]))
     return rows
@@ -2117,6 +2118,142 @@ def inv_report(rows, prev_day, prev_rows, today, base_url, full_backlog=False, u
             L.append(f"- {nw['pr']} · {inv_line(nw, base_url)} · {o['bucket']} → {nw['bucket']}")
         L.append("")
     return L
+
+PM_COLS = [("ToDo", ["ToDo", "Новая"]), ("В работе", ["В процессе"]),
+           ("Баги", ["Баги"]), ("Ждут проверки", ["Можно проверять"]),
+           ("Бэклог", ["Бэклог", "Backlog"])]
+
+def pm_map():
+    """Проект → руководитель. Берётся из карты команды: в самой Taiga
+    руководитель проекта нигде не записан, владелец у всех один."""
+    out = {}
+    for name, v in roster().items():
+        if v.get("role") != "pm" or v.get("all_projects"): continue
+        for sl in (v.get("projects") or []): out.setdefault(sl, []).append(name)
+    return out
+
+def pm_stats(rows, closed7, today):
+    """Состояние одного проекта числами, которые решают, вмешиваться ли."""
+    import datetime
+    td = datetime.date.fromisoformat(today)
+    age = lambda d: (td - datetime.date.fromisoformat(d)).days if d else 0
+    d = {"открыто": len(rows), "закрыто за неделю": closed7,
+         "без исполнителя": len([r for r in rows if not r["uid"]
+                                 and r["bucket"] not in ("Бэклог", "Backlog")])}
+    for lbl, bs in PM_COLS: d[lbl] = len([r for r in rows if r["bucket"] in bs])
+    d["в работе >7 дней"] = len([r for r in rows if r["bucket"] == "В процессе"
+                                 and age(r.get("touched")) >= 7])
+    d["на проверке >14 дней"] = len([r for r in rows if r["bucket"] == "Можно проверять"
+                                     and age(r.get("touched")) >= 14])
+    d["просрочено"] = len([r for r in rows if r["due"] and r["due"] < today])
+    d["заблокировано"] = len([r for r in rows if r["blocked"]])
+    return d
+
+def pm_report(rows, closed, today, base_url):
+    import datetime
+    td = datetime.date.fromisoformat(today)
+    age = lambda d: (td - datetime.date.fromisoformat(d)).days if d else 0
+    owners = pm_map()
+    byproj = {}
+    for r in rows: byproj.setdefault(r["slug"], []).append(r)
+    allp = sorted(set(byproj) | set(closed))
+    groups = {}                       # руководитель → [слаги]
+    for sl in allp:
+        for pm in (owners.get(sl) or ["— без руководителя"]):
+            groups.setdefault(pm, []).append(sl)
+    nm = {r["slug"]: r["pr"] for r in rows}
+    st = {sl: pm_stats(byproj.get(sl, []), closed.get(sl, 0), today) for sl in allp}
+
+    L = [f"# Состояние проектов по руководителям — {td:%d.%m.%Y}", "",
+         f"Открыто карточек: **{len(rows)}** в {len(allp)} проектах. "
+         f"Закрыто за последние 7 дней: **{sum(closed.values())}**.", "",
+         "_Руководитель проекта в самой Taiga не записан — берётся из карты "
+         "команды (`roster` в настройках кита). Проект, которого там нет, "
+         "попадает в «без руководителя»._", "",
+         "## Коротко по руководителям", "",
+         "| Руководитель | Проектов | Открыто | В работе | Ждут проверки | Баги "
+         "| Без исполнителя | Стоит >7 дн | Закрыто за 7 дн |",
+         "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    sm = lambda sls, k: sum(st[x][k] for x in sls)
+    for pm in sorted(groups, key=lambda x: (x.startswith("—"), x)):
+        g = groups[pm]
+        L.append(f"| {pm} | {len(g)} | {sm(g,'открыто')} | {sm(g,'В работе')} "
+                 f"| {sm(g,'Ждут проверки')} | {sm(g,'Баги')} | {sm(g,'без исполнителя')} "
+                 f"| {sm(g,'в работе >7 дней')} | {sm(g,'закрыто за неделю')} |")
+    L.append("")
+
+    for pm in sorted(groups, key=lambda x: (x.startswith("—"), x)):
+        L += [f"## {pm}", "",
+              "| Проект | Открыто | ToDo | В работе | Баги | Ждут проверки | Бэклог "
+              "| Без исполн. | Закрыто за 7 дн |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for sl in sorted(groups[pm], key=lambda x: -st[x]["открыто"]):
+            d = st[sl]
+            L.append(f"| {nm.get(sl, sl)} | {d['открыто']} | {d['ToDo']} | {d['В работе']} "
+                     f"| {d['Баги']} | {d['Ждут проверки']} | {d['Бэклог']} "
+                     f"| {d['без исполнителя']} | {d['закрыто за неделю']} |")
+        L.append("")
+        # Поимённо — только то, на что стоит потратить внимание сегодня.
+        for sl in sorted(groups[pm]):
+            d, rs = st[sl], byproj.get(sl, [])
+            flags = []
+            if d["просрочено"]: flags.append(("Просрочено", [r for r in rs
+                if r["due"] and r["due"] < today]))
+            if d["заблокировано"]: flags.append(("Заблокировано",
+                [r for r in rs if r["blocked"]]))
+            if d["в работе >7 дней"]: flags.append(("В работе больше недели",
+                [r for r in rs if r["bucket"] == "В процессе" and age(r.get("touched")) >= 7]))
+            if d["на проверке >14 дней"]: flags.append(("На проверке больше двух недель",
+                [r for r in rs if r["bucket"] == "Можно проверять" and age(r.get("touched")) >= 14]))
+            if not flags: continue
+            L += [f"### {nm.get(sl, sl)} — требует внимания", ""]
+            for lbl, items in flags:
+                L.append(f"**{lbl}: {len(items)}**")
+                L.append("")
+                L += ["| Не трогали, дней | № | Задача | Кто |", "|---:|---|---|---|"]
+                for r in sorted(items, key=lambda x: -age(x.get("touched")))[:12]:
+                    L.append(f"| {age(r.get('touched'))} | [#{r['ref']}]({_url(r, base_url)}) "
+                             f"| {cut(r['subj'], 56)} | {r['who'] or '—'} |")
+                if len(items) > 12: L.append(f"| … | ещё {len(items)-12} | | |")
+                L.append("")
+    return L
+
+def cmd_pm(args):
+    """Состояние проектов, сгруппированное по руководителям."""
+    import datetime
+    auth()
+    TZ = datetime.datetime.now().astimezone().tzinfo
+    today = datetime.datetime.now(TZ).date()
+    c, projects = api("GET", "/projects")
+    if projects == []: die("список проектов пуст при подтверждённой личности — подозрительно")
+    rows = inv_collect(projects)
+    # Темп: закрытия за последние семь суток. Журнал переходов — единственный
+    # честный источник: признак закрытости на карточке устаревает.
+    end = datetime.datetime(today.year, today.month, today.day, tzinfo=TZ) \
+          + datetime.timedelta(days=1)
+    start = end - datetime.timedelta(days=7)
+    events, created, users, projs = scan_day(start.astimezone(datetime.timezone.utc),
+                                             end.astimezone(datetime.timezone.utc))
+    closed = {}
+    for e in events:
+        if e["to_closed"] and not e["from_closed"]:
+            closed[e["slug"]] = closed.get(e["slug"], 0) + 1
+    L = pm_report(rows, closed, today.isoformat(), base())
+    rd = reports_dir(); rd.mkdir(parents=True, exist_ok=True)
+    out = rd / f"Состояние-проектов_{today:%Y-%m-%d}.md"
+    out.write_text("\n".join(L) + "\n")
+    ok(str(out))
+    if args.send:
+        rec = cfg_load().get("telegram_recipients", {})
+        n = 0
+        for v in rec.values():
+            rp = roster().get(roster_alias(v.get("name") or "")) or {}
+            if rp.get("role") != "cto": continue
+            r = tg_document(int(v["chat_id"]), out,
+                            f"Состояние проектов по руководителям — {today:%d.%m.%Y}")
+            if r.get("ok"): n += 1
+            else: ok(f"  {v.get('name')}: ОШИБКА {r.get('description')}")
+        ok(f"отправлено: {n}")
 
 def cmd_inventory(args):
     import datetime, collections
@@ -5126,6 +5263,9 @@ def main():
     at = P("attach"); at.add_argument("ref"); at.add_argument("file")
     at.add_argument("--desc", help="подпись к вложению")
     at.set_defaults(fn=cmd_attach)
+    pm = P("pm"); pm.add_argument("--send", action="store_true",
+                                  help="отправить файл в Telegram")
+    pm.set_defaults(fn=cmd_pm)
     mb = P("member")
     mb.add_argument("who", nargs="?", metavar="КТО", help="фамилия или логин; пусто — показать состав")
     mb.add_argument("--role", metavar="РОЛЬ", help="роль в проекте; без неё берётся из карты команды")
