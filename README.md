@@ -221,7 +221,7 @@ taiga init <слаг> [--here]
 taiga login [--here] | refresh
 
 taiga ls [--open] [--mine] [--status X] [--kind us|task|issue|epic]
-taiga show <номер>
+taiga show <номер>                 # карточка, переходы, комментарии
 
 taiga new "текст" [--kind task --parent N] [--assign имя] [--status X]
        [--desc "текст"]      описание; \n разворачивается в перенос строки

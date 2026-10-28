@@ -17,7 +17,7 @@ description: Работа с трекером Taiga и разбор тикето
 taiga status                       кто я, какой проект подхватился
 taiga projects                     список проектов: слаг, id, название
 taiga ls [--open] [--mine] [--status X] [--kind us|task|issue|epic]
-taiga show <номер>                 карточка + история переходов
+taiga show <номер>                 карточка, история переходов и комментарии
 taiga new "текст" [--kind task --parent <номер>] [--assign имя] [--status X]
                   [--desc "текст"] [--desc-file ФАЙЛ]
 taiga mv <номер> "<статус>"

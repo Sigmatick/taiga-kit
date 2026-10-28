@@ -404,6 +404,16 @@ def cmd_show(args):
         for e in reversed(ev):
             v = e["values_diff"]["status"]
             ok(f"    {e['created_at'][:16]}  {(e.get('user') or {}).get('name','?'):<22} {v[0]} → {v[1]}")
+    # Удалённый комментарий остаётся в истории с пустым текстом — его не показываем.
+    cm = [e for e in (h or []) if (e.get("comment") or "").strip()
+          and not e.get("delete_comment_date")]
+    if cm:
+        ok(f"\n  комментарии ({len(cm)}):")
+        for e in reversed(cm):
+            edited = " · правлен" if e.get("edit_comment_date") else ""
+            ok(f"    {e['created_at'][:16]}  {(e.get('user') or {}).get('name','?')}{edited}")
+            for ln in (e.get("comment") or "").strip().splitlines():
+                ok(f"      {ln}".rstrip())
 
 def resolve_sprint(pid, text):
     """Спринт по названию или «текущий» — по датам. Закрытые не предлагаем:
