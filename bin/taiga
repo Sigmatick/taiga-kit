@@ -1744,7 +1744,7 @@ def test_block(events, queue):
               "| Время | Проект | # | Название | Кто |", "|---|---|---:|---|---|"]
         for x in sorted(rows, key=lambda z: z["at"]):
             L.append(f"| {x['at'][11:16]} | {x['project']} | {x['ref']} "
-                     f"| {cut(x['subject'], 46)} | {x['who']} |")
+                     f"| {subj_md(x['subject'])} | {x['who']} |")
     return L
 
 def test_tg(events, queue, only=None):
@@ -1906,22 +1906,22 @@ def week_block(goals, daily_refs, cache, monday, day):
             continue
         tks = week_tasks(it["slug"], it["ref"], cache) if it["kind"] == "us" else []
         if not tks:
-            L.append(f"| {it['project']} #{it['ref']} · {cut(it['subject'], 34)} "
+            L.append(f"| {it['project']} #{it['ref']} · {subj_md(it['subject'])} "
                      f"| — | — | — | — | — |")
-            detail.append(("•", f"{it['project']} #{it['ref']} · {cut(it['subject'], 60)} · "
+            detail.append(("•", f"{it['project']} #{it['ref']} · {subj_md(it['subject'])} · "
                                 f"{it['status']} — задач внутри нет", []))
             continue
         closed = [t for t in tks if t["closed"]]
         prog = [t for t in tks if not t["closed"] and "progress" in t["status"].lower()]
         rest = [t for t in tks if not t["closed"] and t not in prog]
         named = [t for t in tks if t["ref"] in daily_refs.get(it["slug"], set())]
-        L.append(f"| {it['project']} #{it['ref']} · {cut(it['subject'], 34)} | {len(tks)} "
+        L.append(f"| {it['project']} #{it['ref']} · {subj_md(it['subject'])} | {len(tks)} "
                  f"| {len(closed)} | {len(prog)} | {len(rest)} | {len(named)} |")
         # Закрытые на этой неделе, которых в дейликах не называли, — работа мимо плана.
         quiet = [t for t in closed
                  if t["modified"] and _d(t["modified"]) >= mon_utc
                  and t["ref"] not in daily_refs.get(it["slug"], set())]
-        detail.append(("", f"{it['project']} #{it['ref']} · {cut(it['subject'], 60)}",
+        detail.append(("", f"{it['project']} #{it['ref']} · {subj_md(it['subject'])}",
                        [(t, t["ref"] in daily_refs.get(it["slug"], set()), t in quiet) for t in tks]))
     for mark, head, tks in detail:
         L += ["", f"**{mark} {head}**".replace("** ", "**")]
@@ -1929,7 +1929,7 @@ def week_block(goals, daily_refs, cache, monday, day):
             m = "✅" if t["closed"] else ("▶" if "progress" in t["status"].lower() else "⏸")
             tail = "" if named else ("  ← закрыта на этой неделе, в дейликах не называлась"
                                      if quiet else "  ← в дейликах не называлась")
-            L.append(f"- {m} #{t['ref']} · {cut(t['subject'], 54)} · {t['status']}{tail}")
+            L.append(f"- {m} #{t['ref']} · {subj_md(t['subject'])} · {t['status']}{tail}")
     return L
 
 def week_tg(goals, daily_refs, cache):
@@ -2031,7 +2031,7 @@ def inv_attention(rows, today):
 def inv_line(r, base_url):
     """Строка карточки: номер ссылкой, родитель и спринт — если есть."""
     u = f"{base_url}/project/{r['slug']}/{WEB_PATH[r['kind']]}/{r['ref']}"
-    s = f"[#{r['ref']}]({u}) {cut(r['subj'], 90)}"
+    s = f"[#{r['ref']}]({u}) {subj_md(r['subj'])}"
     tail = []
     if r["parent"]: tail.append(f"US #{r['parent']}")
     if r["sprint"]: tail.append(f"спринт {r['sprint']}")
@@ -2223,7 +2223,7 @@ def pm_report(rows, closed, today, base_url):
                 L += ["| Не трогали, дней | № | Задача | Кто |", "|---:|---|---|---|"]
                 for r in sorted(items, key=lambda x: -age(x.get("touched")))[:12]:
                     L.append(f"| {age(r.get('touched'))} | [#{r['ref']}]({_url(r, base_url)}) "
-                             f"| {cut(r['subj'], 56)} | {r['who'] or '—'} |")
+                             f"| {subj_md(r['subj'])} | {r['who'] or '—'} |")
                 if len(items) > 12: L.append(f"| … | ещё {len(items)-12} | | |")
                 L.append("")
     return L
@@ -2394,7 +2394,7 @@ def morn_dev(name, rows, uid, prev, prev_day, today, base_url):
             if r["due"]: ex.append(f"срок {r['due']}")
             if r["blocked"]: ex.append("ЗАБЛОКИРОВАНА")
             L.append(f"| {r['created']} | {BUCKET_TYPE.get(r['bucket'], '')} "
-                     f"| [#{r['ref']}]({_url(r, base_url)}) | {cut(r['subj'], 70)}"
+                     f"| [#{r['ref']}]({_url(r, base_url)}) | {subj_md(r['subj'])}"
                      + (f" · {', '.join(ex)}" if ex else "") + " |")
         L.append("")
     if not mine: L += ["Ничего не ждёт вашего хода.", ""]
@@ -2405,7 +2405,7 @@ def morn_dev(name, rows, uid, prev, prev_day, today, base_url):
     for nm, rs in (("Просрочены", over), ("Заблокированы", blk)):
         if not rs: continue
         L.append(f"**{nm}: {len(rs)}**")
-        for r in rs: L.append(f"- {r['pr']} #{r['ref']} · {cut(r['subj'], 70)}")
+        for r in rs: L.append(f"- {r['pr']} #{r['ref']} · {subj_md(r['subj'])}")
     if prev:
         pk = {(r['slug'], r['kind'], r['ref']) for r in prev
               if r.get('uid') == uid and r['bucket'] in WORK_BUCKETS}
@@ -2443,7 +2443,7 @@ def morn_qa(name, rows, slugs, prev, prev_day, today, base_url):
                   "| Поставлена | Дней | № | Задача | От кого |", "|---|---:|---|---|---|"]
             for r in sorted(part, key=lambda x: (x["created"], -x["ref"])):
                 L.append(f"| {r['created']} | {_age(r, td)} "
-                         f"| [#{r['ref']}]({_url(r, base_url)}) | {cut(r['subj'], 62)} "
+                         f"| [#{r['ref']}]({_url(r, base_url)}) | {subj_md(r['subj'])} "
                          f"| {r['who'] or '—'} |")
             L.append("")
     if not rft: L += ["Очередь пуста.", ""]
@@ -2771,7 +2771,7 @@ def pm_evening(name, events, planned, pnames, day, cache, slug2name, base_url,
                 L.append(f"| {dt}"
                          f" | {ev_kind(e)} "
                          f"| [#{e['ref']}]({base_url}/project/{e['slug']}/"
-                         f"{WEB_PATH[e['kind']]}/{e['ref']}) | {cut(e['subject'], 56)} "
+                         f"{WEB_PATH[e['kind']]}/{e['ref']}) | {subj_md(e['subject'])} "
                          f"| {e['who']} | {'да' if inplan(e) else '—'} |")
             L.append("")
         if miss:
@@ -2779,7 +2779,7 @@ def pm_evening(name, events, planned, pnames, day, cache, slug2name, base_url,
                   "| № | Задача | Сейчас |", "|---|---|---|"]
             for g, it in miss:
                 L.append(f"| [#{g[2]}]({base_url}/project/{g[0]}/{WEB_PATH[g[1]]}/{g[2]}) "
-                         f"| {cut((it or {}).get('subject') or '—', 56)} "
+                         f"| {subj_md((it or {}).get('subject') or '—')} "
                          f"| {(it or {}).get('status') or '?'} |")
             L.append("")
     return L
@@ -3263,6 +3263,12 @@ def st_icon(status):
     if "progress" in t or "работе" in t:               return "\u25B6"       # ▶
     if "test" in t or "тест" in t:                     return "\U0001F9EA"   # 🧪
     return "\u2022"                                                          # •
+
+def subj_md(t):
+    """Название целиком — для файла. В markdown длина не мешает, а обрезанное
+    название заставляет лезть в трекер, чтобы понять, о какой карточке речь.
+    Вертикальную черту экранируем: иначе она ломает таблицу."""
+    return " ".join((t or "").split()).replace("|", "\\|") or "—"
 
 def cut(t, n=120):
     """Обрезать по границе слова. «нет соо» читателю не говорит ничего —
