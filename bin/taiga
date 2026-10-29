@@ -2357,8 +2357,12 @@ def cmd_inventory(args):
 # Один файл в день каждому, по его роли. Общая опись и текстовые сводки
 # убраны: человек тонул в чужом. Карточки на проверке исключены у всех,
 # кроме тестировщиков, — там ход не их.
-WORK_BUCKETS = ["Баги", "В процессе", "ToDo"]
-BUCKET_TYPE = {"Баги": "bug", "В процессе": "в работе", "ToDo": "todo"}
+# Бэклог и «Новая» тоже показываем: карточку заводят в бэклоге и там её
+# никто не видит, пока кто-то вручную не переложит в ToDo.
+WORK_BUCKETS = ["Баги", "В процессе", "ToDo", "Новая", "Нужны сведения", "Бэклог"]
+BUCKET_TYPE = {"Баги": "bug", "В процессе": "в работе", "ToDo": "todo",
+               "Новая": "новая", "Нужны сведения": "нужны сведения",
+               "Бэклог": "бэклог"}
 AGE_BUCKETS = [("Пришло сегодня", 0, 0), ("На этой неделе", 1, 7),
                ("Лежит дольше недели", 8, 30), ("Лежит больше месяца", 31, 99999)]
 
@@ -2382,14 +2386,16 @@ def morn_dev(name, rows, uid, prev, prev_day, today, base_url):
     for r in mine: byp.setdefault(r["pr"], []).append(r)
     L = [f"# Мои задачи — {datetime.date.fromisoformat(today):%d.%m.%Y}", "",
          f"**{name}**", "",
-         f"Требуют вашего хода: **{len(mine)}**"
+         f"На вас открыто: **{len(mine)}**"
          + (f" в {len(byp)} проектах" if byp else "")
          + f" · на проверке у тестировщиков: **{ontest}**", "",
          "_Карточки на проверке сюда не попадают: ход за тестировщиком._", ""]
     for p in sorted(byp, key=lambda k: -len(byp[k])):
         L += [f"## {p} — {len(byp[p])}", "",
               "| Поставлена | Тип | № | Задача |", "|---|---|---|---|"]
-        for r in sorted(byp[p], key=lambda x: (x["created"], -x["ref"])):
+        # Сначала баги и то, что в работе; бэклог — в конце списка.
+        for r in sorted(byp[p], key=lambda x: (WORK_BUCKETS.index(x["bucket"]),
+                                               x["created"], -x["ref"])):
             ex = []
             if r["due"]: ex.append(f"срок {r['due']}")
             if r["blocked"]: ex.append("ЗАБЛОКИРОВАНА")
@@ -2397,7 +2403,7 @@ def morn_dev(name, rows, uid, prev, prev_day, today, base_url):
                      f"| [#{r['ref']}]({_url(r, base_url)}) | {subj_md(r['subj'])}"
                      + (f" · {', '.join(ex)}" if ex else "") + " |")
         L.append("")
-    if not mine: L += ["Ничего не ждёт вашего хода.", ""]
+    if not mine: L += ["На вас ничего не открыто.", ""]
     over = [r for r in mine if r["due"] and r["due"] < today]
     blk = [r for r in mine if r["blocked"]]
     L += ["## Требует внимания", ""]
