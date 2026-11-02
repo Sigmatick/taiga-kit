@@ -2499,8 +2499,13 @@ def cmd_morning(args):
     subs = subs_load()
     base_url = base()
     sent = 0
+    # Повторная отправка одному: снимок при этом не трогаем, иначе
+    # завтрашнее «что изменилось» посчитается от сегодняшней рассылки.
+    only = (getattr(args, "only", None) or "").strip().lower()
     for tid, v in rec.items():
         who, chat = v["name"], int(v["chat_id"])
+        if only and only not in who.lower() \
+           and only not in roster_alias(who).lower(): continue
         role = roster_role(who)
         # Фамилии повторяются: два Пороха давали один файл, второй затирал
         # первый. Добавляем идентификатор — он уникален всегда.
@@ -2530,7 +2535,10 @@ def cmd_morning(args):
             r = tg_document(chat, f, f"{kind.replace('_', ' ')} · {datetime.date.fromisoformat(today):%d.%m.%Y}")
             sent += 1 if r.get("ok") else 0
         ok(f"  {who:<22} {kind} · {f.name}")
-    if not args.dry: inv_snap_save(today, rows)
+    if not args.dry and not only: inv_snap_save(today, rows)
+    if only and args.dry: ok("показан состав; отправить — то же без --dry")
+    if only and not any(only in v["name"].lower() for v in rec.values()):
+        die(f"в получателях нет никого похожего на «{args.only}»")
     ok(f"разослано: {sent}")
 
 def simple_install(label, argv, args, dh, dm):
@@ -5328,6 +5336,7 @@ def main():
     mo.add_argument("--install", action="store_true", help="расписание: будни 08:30")
     mo.add_argument("--uninstall", action="store_true")
     mo.add_argument("--at", default="8:30", metavar="ЧЧ:ММ")
+    mo.add_argument("--only", metavar="ИМЯ", help="переслать одному человеку")
     mo.set_defaults(fn=cmd_morning)
     iv = P("inventory")
     iv.add_argument("--send", action="store_true", help="разослать файлом руководителям")
