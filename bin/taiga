@@ -918,9 +918,12 @@ def cmd_member(args):
     # Человека ищем ДО разбора роли: иначе на опечатку в фамилии приходил
     # ответ «не указана роль», и искали не там.
     c, all_users = api("GET", "/users")
+    # В Taiga человек может быть записан латиницей («Alexey Kovalev»), а звать
+    # его будут по-русски. Карта команды это знает — спрашиваем и её.
+    names = {args.who.lower(), roster_alias(args.who).lower()}
     hit = [u for u in (all_users or [])
-           if args.who.lower() in (u.get("full_name_display") or "").lower()
-           or args.who.lower() == (u.get("username") or "").lower()]
+           if any(n in (u.get("full_name_display") or "").lower() for n in names)
+           or any(n == (u.get("username") or "").lower() for n in names)]
     if not hit: die(f"«{args.who}» не найден среди людей инстанса — см. `taiga users`")
     if len(hit) > 1:
         die(f"«{args.who}» подходит нескольким: "
