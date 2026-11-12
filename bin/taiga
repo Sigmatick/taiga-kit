@@ -309,8 +309,31 @@ def cmd_login(args):
 
 def cmd_refresh(args): ok("обновлено" if do_refresh(quiet=True) else "refresh не принят — нужен `taiga login`")
 
+def kit_version():
+    """Версия ЗАПУЩЕННОГО файла. Лежит рядом в plugin.json, если кит взят
+    из репозитория; у копии, снятой установщиком, его рядом нет."""
+    f = pathlib.Path(sys.argv[0]).resolve()
+    for up in (f.parent.parent, f.parent):
+        j = up / ".claude-plugin" / "plugin.json"
+        if j.is_file():
+            try: return json.loads(j.read_text()).get("version") or "?"
+            except Exception: return "?"
+    return None
+
 def cmd_status(args):
     me = auth()
+    # Какой именно файл сейчас работает. Правка в репозитории не доходит до
+    # копии, снятой установщиком, и человек читает один код, а запускает
+    # другой: так замечание «show не печатает комментарии» пришло на код,
+    # где они печатались третью неделю.
+    f = pathlib.Path(sys.argv[0]).resolve()
+    import datetime
+    try: when = datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
+    except Exception: when = "?"
+    v = kit_version()
+    ok(f"кит:      {f}")
+    ok(f"          файл от {when}" + (f" · версия {v}" if v else
+       "  ← копия установщика: `git pull` её НЕ меняет, нужен ./install.sh"))
     ok(f"инстанс:  {base()}")
     ok(f"личность: {me.get('full_name_display') or me.get('username')} (id {me['id']})")
     ok(f"конфиг:   {C.path or '— не найден в этой папке и выше'}")
@@ -378,6 +401,13 @@ def cmd_ls(args):
     c, st = api("GET", f"/{KINDS[kind][2]}?project={p['id']}")
     closed_ids = {s["id"] for s in (st or []) if s.get("is_closed")}
     is_closed = lambda i: i["status"] in closed_ids
+    # Фильтр по родителю: спросить состав истории — частый вопрос, а до
+    # сих пор на него отвечали глазами по доске.
+    if getattr(args, "parent", None):
+        if kind != "task": die("--parent имеет смысл только для --kind task")
+        pref = int(re.sub(r"\D", "", str(args.parent)))
+        items = [i for i in items
+                 if (i.get("user_story_extra_info") or {}).get("ref") == pref]
     if args.open: items = [i for i in items if not is_closed(i)]
     if args.mine: items = [i for i in items if i.get("assigned_to") == IDENTITY["id"]]
     if args.status: items = [i for i in items if args.status.lower() in
@@ -396,7 +426,31 @@ def cmd_show(args):
     ok(f"  статус:      {f['status_extra_info']['name']} (закрывающий: {f['status_extra_info'].get('is_closed')})")
     ok(f"  исполнитель: {(f.get('assigned_to_extra_info') or {}).get('full_name_display') or '—'}")
     ok(f"  создана:     {f['created_date'][:10]} · версия {f['version']}")
+    # Родитель у задачи: без него номер задачи висит в воздухе, и чтобы
+    # понять, к чему она, приходится лезть в веб.
+    if kind == "task":
+        par = f.get("user_story_extra_info") or {}
+        if par.get("ref"):
+            ok(f"  история:     #{par['ref']} {par.get('subject') or ''}")
     if f.get("description"): ok("\n" + f["description"])
+    # Состав истории. Сводная история живёт ровно своими задачами: без их
+    # списка состав собирают перебором номеров подряд и часть теряют.
+    if kind == "us":
+        c, kids = api("GET", f"/tasks?project={p['id']}&user_story={it['id']}", nopage=True)
+        kids = kids or []
+        if kids:
+            # Закрытость — по каталогу статусов, а не по полю объекта: Taiga
+            # дублирует is_closed на объект и не пересчитывает его при правке
+            # каталога или возврате карточки.
+            c, st = api("GET", f"/task-statuses?project={p['id']}")
+            shut = {x["id"] for x in (st or []) if x.get("is_closed")}
+            live = [x for x in kids if x["status"] not in shut]
+            ok(f"\n  задачи ({len(kids)}, открыто {len(live)}):")
+            for x in sorted(kids, key=lambda z: z["ref"]):
+                who = (x.get("assigned_to_extra_info") or {}).get("full_name_display") or "—"
+                mark = " " if x["status"] not in shut else "×"
+                ok(f"   {mark}#{x['ref']:<5} [{(x.get('status_extra_info') or {}).get('name','?'):<14}] "
+                   f"{cut(x.get('subject') or '', 56):<58} {who}")
     c, h = api("GET", f"/history/{KINDS[kind][1]}/{it['id']}")
     ev = [e for e in (h or []) if "status" in (e.get("values_diff") or {})]
     if ev:
@@ -5387,7 +5441,9 @@ def main():
     lg = P("login"); lg.add_argument("--here", action="store_true", help="токен в .taiga/ этого проекта"); lg.set_defaults(fn=cmd_login)
     P("refresh").set_defaults(fn=cmd_refresh); P("status").set_defaults(fn=cmd_status); P("projects").set_defaults(fn=cmd_projects)
     i = P("init"); i.add_argument("slug"); i.add_argument("--name"); i.add_argument("--here", action="store_true"); i.add_argument("--force", action="store_true"); i.set_defaults(fn=cmd_init)
-    l = P("ls"); l.add_argument("--open", action="store_true"); l.add_argument("--mine", action="store_true"); l.add_argument("--status"); l.set_defaults(fn=cmd_ls)
+    l = P("ls"); l.add_argument("--open", action="store_true"); l.add_argument("--mine", action="store_true"); l.add_argument("--status")
+    l.add_argument("--parent", metavar="НОМЕР", help="только задачи этой истории (с --kind task)")
+    l.set_defaults(fn=cmd_ls)
     s = P("show"); s.add_argument("ref"); s.set_defaults(fn=cmd_show)
     n = P("new"); n.add_argument("subject"); n.add_argument("--parent"); n.add_argument("--assign"); n.add_argument("--status")
     n.add_argument("--sprint", nargs="?", const="текущий", metavar="НАЗВАНИЕ",
