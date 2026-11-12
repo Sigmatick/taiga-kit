@@ -3325,6 +3325,8 @@ TG_HELP = (
     "проекты все — за всеми\n"
     "проекты — показать, за чем слежу сейчас\n"
     "я — связать чат со своей учётной записью Taiga\n"
+    "задачи — показать, что открыто на вас прямо сейчас\n"
+    "фильтр — выбрать кнопками, какие кучки показывать\n"
     "сразу / вечером — переключить режим\n"
     "стоп — отписаться\n"
     "проекты? — выбрать кнопками\n\n"
@@ -3342,6 +3344,140 @@ def subs_defaults(e):
     return e
 def subs_save(d): cfg_set("column_subs", d)
 
+# --- «покажи мои задачи»: список по требованию ------------------------------
+
+# Кучки, которые человек может включить себе в выдачу. Порядок тот же, что
+# в описи: сначала то, что горит, бэклог — последним.
+TASKS_BUCKETS = ["Баги", "В процессе", "Можно проверять", "ToDo", "Новая",
+                 "Нужны сведения", "Бэклог"]
+# По умолчанию — только то, что реально в работе. Бэклог и новые человек
+# включает сам: иначе первый же ответ бота окажется простынёй на сто строк,
+# и команду перестанут набирать.
+TASKS_DEFAULT = ["Баги", "В процессе", "ToDo"]
+# Телеграм режет сообщение на 4096 символах. Молча потерянный хвост хуже
+# честного «показаны первые N» — поэтому считаем сами.
+TASKS_MAX = 40
+
+def tasks_filter(cid):
+    """Какие кучки показывать этому чату. Нет записи — умолчание."""
+    f = cfg_load().get("task_filter", {}).get(str(cid))
+    return [b for b in TASKS_BUCKETS if b in f] if f else list(TASKS_DEFAULT)
+
+def tasks_filter_set(cid, buckets):
+    f = cfg_load().get("task_filter", {})
+    f[str(cid)] = [b for b in TASKS_BUCKETS if b in buckets]
+    cfg_set("task_filter", f)
+
+def tasks_uid(cid):
+    """Учётная запись Taiga, привязанная к чату. Без неё «мои задачи»
+    не имеют смысла: бот не знает, кто спрашивает."""
+    rec = cfg_load().get("telegram_recipients", {})
+    for uid, v in rec.items():
+        if int(v.get("chat_id", 0)) == int(cid): return int(uid), v.get("name") or ""
+    return None, None
+
+def tasks_mine(uid):
+    """Открытые карточки человека одним запросом на род. Обход всех проектов
+    тут не годится: опись собирается минутами, а ответ в чате ждут секунду.
+    Сервер умеет и assigned_to, и отсев закрытых — пользуемся этим."""
+    rows = []
+    for kind, ep in (("us", "userstories"), ("task", "tasks"), ("issue", "issues")):
+        c, objs = api("GET", f"/{ep}?assigned_to={uid}&status__is_closed=false",
+                      nopage=True)
+        if c != 200: continue
+        for o in (objs or []):
+            nm = (o.get("status_extra_info") or {}).get("name") or "?"
+            pr = o.get("project_extra_info") or {}
+            rows.append({
+                "pr": pr.get("name") or "", "slug": pr.get("slug") or "",
+                "kind": kind, "ref": o["ref"], "subj": o.get("subject") or "",
+                "status": nm, "bucket": inv_bucket(nm),
+                "parent": (o.get("user_story_extra_info") or {}).get("ref"),
+                "due": o.get("due_date"), "blocked": bool(o.get("is_blocked")),
+                "created": (o.get("created_date") or "")[:10],
+            })
+    rows.sort(key=lambda r: (TASKS_BUCKETS.index(r["bucket"])
+                             if r["bucket"] in TASKS_BUCKETS else 9,
+                             r["pr"], r["created"], -r["ref"]))
+    return rows
+
+def tasks_text(cid):
+    """Ответ на «задачи». Ссылка на каждую карточку: иначе человек
+    всё равно пойдёт искать её в трекере руками."""
+    uid, who = tasks_uid(cid)
+    if not uid:
+        return ("Не знаю, кто вы в Taiga. Напишите «я» — покажу список "
+                "сотрудников, выберите себя, администратор подтвердит.")
+    want = tasks_filter(cid)
+    rows = [r for r in tasks_mine(uid) if r["bucket"] in want]
+    if not rows:
+        return ("На вас ничего не открыто в выбранных кучках "
+                f"({', '.join(want)}).\nДобавить кучки — «фильтр».")
+    u = base()
+    out = [f"На вас открыто: {len(rows)}"]
+    cur = None
+    for r in rows[:TASKS_MAX]:
+        if r["bucket"] != cur:
+            cur = r["bucket"]
+            out.append("")
+            out.append(f"— {cur} —")
+        link = f"{u}/project/{r['slug']}/{WEB_PATH[r['kind']]}/{r['ref']}"
+        tail = []
+        if r["pr"]: tail.append(r["pr"])
+        if r["due"]: tail.append(f"срок {r['due']}")
+        if r["blocked"]: tail.append("ЗАБЛОКИРОВАНА")
+        out.append(f"#{r['ref']} {cut(r['subj'], 90)}"
+                   + (f"\n   {', '.join(tail)}" if tail else "")
+                   + f"\n   {link}")
+    if len(rows) > TASKS_MAX:
+        out.append(f"\n…и ещё {len(rows) - TASKS_MAX}. Сузить — «фильтр».")
+    out.append("\nЧто показывать — «фильтр».")
+    return "\n".join(out)
+
+def tasks_board(cid):
+    """Галочки кучек. Настройка кнопками, а не словами: слаг человек
+    напишет, а «Нужны сведения» наберёт с ошибкой и решит, что бот сломан."""
+    cur = tasks_filter(cid)
+    rows, row = [], []
+    for i, b in enumerate(TASKS_BUCKETS):
+        row.append({"text": ("[x] " if b in cur else "[  ] ") + b,
+                    "callback_data": f"tf:{i}"})
+        if len(row) == 2: rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([{"text": "Готово", "callback_data": "tf:*done"}])
+    return ("Что показывать по команде «задачи».\n"
+            "Сейчас: " + (", ".join(cur) if cur else "ничего"),
+            {"inline_keyboard": rows})
+
+def tasks_tap(q):
+    """Нажатие галочки кучки."""
+    msg = q.get("message") or {}
+    cid = (msg.get("chat") or {}).get("id"); mid = msg.get("message_id")
+    arg = (q.get("data") or "")[3:]
+    if not cid: return
+    if arg == "*done":
+        cur = tasks_filter(cid)
+        tg_call("answerCallbackQuery", {"callback_query_id": q["id"], "text": "Сохранено"})
+        tg_call("editMessageText", {"chat_id": cid, "message_id": mid,
+            "text": "Показываю: " + (", ".join(cur) if cur else "ничего")
+                    + "\nМенять — «фильтр», смотреть — «задачи»."})
+        return
+    try: b = TASKS_BUCKETS[int(arg)]
+    except Exception: return
+    cur = tasks_filter(cid)
+    # Снял последнюю галочку — показывать стало нечего. Молчаливый пустой
+    # ответ выглядит поломкой, поэтому возвращаем умолчание и говорим об этом.
+    cur = [x for x in cur if x != b] if b in cur else cur + [b]
+    note = ""
+    if not cur:
+        cur = list(TASKS_DEFAULT); note = "Пусто нельзя — вернул умолчание"
+    tasks_filter_set(cid, cur)
+    tg_call("answerCallbackQuery", {"callback_query_id": q["id"],
+                                    "text": note or (("включил " if b in cur else "убрал ") + b)})
+    head, kb = tasks_board(cid)
+    tg_call("editMessageText", {"chat_id": cid, "message_id": mid,
+                                "text": head, "reply_markup": kb})
+
 def tg_cmd(cid, text, slugs, names):
     """Разобрать сообщение от человека. Возвращает текст ответа или None."""
     t = " ".join((text or "").split())
@@ -3357,6 +3493,11 @@ def tg_cmd(cid, text, slugs, names):
 
     if low in ("я", "связать", "кто я", "link"):
         return "__WHOAMI__"
+    if low in ("задачи", "мои задачи", "мои", "что на мне", "задачи?",
+               "покажи мои задачи", "мои таски", "tasks", "my"):
+        return "__TASKS__"
+    if low in ("фильтр", "настройка", "настроить", "фильтр?", "filter"):
+        return "__FILTER__"
     if low in ("проекты?", "проекты ?", "список", "projects?", "выбрать", "режим"):
         return "__BOARD__"
     if low in ("сразу", "вечером"):
@@ -3765,6 +3906,7 @@ def tg_poll(quiet=True, long=False):
             q = u["callback_query"]; dt = q.get("data") or ""
             if dt.startswith(("ly:", "ln:")): link_decide(q)
             elif dt.startswith("l:"): link_pick(q, link_people())
+            elif dt.startswith("tf:"): tasks_tap(q)
             elif slugs: tg_tap(q, slugs, names)
             continue
         m = u.get("message") or u.get("edited_message") or {}
@@ -3781,6 +3923,14 @@ def tg_poll(quiet=True, long=False):
             ans = tg_cmd(cid, m.get("text"), slugs, names)
             if ans == "__BOARD__":
                 head, kb = tg_board(cid, slugs, names)
+                tg_call("sendMessage", {"chat_id": cid, "text": head, "reply_markup": kb})
+                ans = None
+            elif ans == "__TASKS__":
+                tg_call("sendMessage", {"chat_id": cid, "text": tasks_text(cid),
+                                        "disable_web_page_preview": True})
+                ans = None
+            elif ans == "__FILTER__":
+                head, kb = tasks_board(cid)
                 tg_call("sendMessage", {"chat_id": cid, "text": head, "reply_markup": kb})
                 ans = None
             elif ans == "__WHOAMI__":
@@ -3813,7 +3963,9 @@ def tg_poll(quiet=True, long=False):
             "по мере поступления на проверку.\n\n"
             "«помощь» — все команды.\n\n"
             "Чтобы получать СВОИ задачи, напишите «я» — покажу список "
-            "сотрудников, выберите себя. Администратор подтвердит."})
+            "сотрудников, выберите себя. Администратор подтвердит.\n\n"
+            "После этого в любой момент «задачи» — покажу, что на вас "
+            "открыто; «фильтр» — какие кучки показывать."})
     if new: cfg_set("telegram_seen", known)
     # Смещение двигаем ПОСЛЕДНИМ: сорвались раньше — сообщения придут снова
     # и команды применятся повторно, что безопасно. Наоборот было бы потерей.
