@@ -63,8 +63,16 @@ def tok():
 
 def write_secret(p, v):
     p.parent.mkdir(parents=True, exist_ok=True); os.chmod(p.parent, 0o700)
-    t = p.with_suffix(p.suffix+".tmp"); t.write_text(v); os.chmod(t, 0o600)
-    t.replace(p); os.chmod(p, 0o600)
+    # Своё имя на процесс: обновление токена из двух заданий разом роняло
+    # прогон на FileNotFoundError .taiga.token.tmp — ловилось на report.
+    t = p.with_suffix(p.suffix + f".{os.getpid()}.tmp")
+    try:
+        t.write_text(v); os.chmod(t, 0o600)
+        t.replace(p); os.chmod(p, 0o600)
+    finally:
+        if t.exists():
+            try: t.unlink()
+            except OSError: pass
 
 def guard_gitignore(d: pathlib.Path):
     """Игнор дописывается ДО записи секрета: иначе окно, в которое попадёт git add -A."""
@@ -238,8 +246,21 @@ def auth():
         if c != 200: die(f"канарейка {c} после refresh")
     IDENTITY = me; return me
 
+def warn(m): print(m, file=sys.stderr)
+
 def api(method, path, body=None, nopage=False):
-    auth(); return raw(method, path, body, nopage=nopage)
+    auth()
+    c, d = raw(method, path, body, nopage=nopage)
+    # Тело отказа — словарь или строка, а вызывающий ждёт список и сразу его
+    # перебирает. Ночной notify падал на этом с «string indices must be
+    # integers» — по виду ошибка кита, на деле 502 от трекера. Для чтения
+    # отдаём пустоту и говорим вслух; 404 молча — на нём стоит поиск по роду
+    # (find_item перебирает us/task/issue/epic и три промаха — норма).
+    # Мутации возвращаем как есть: там тело отказа разбирают осознанно.
+    if method == "GET" and not (200 <= c < 300):
+        if c != 404: warn(f"Taiga ответила {c} на GET {path}: {str(d)[:120]}")
+        return c, None
+    return c, d
 
 # ── справочники ──────────────────────────────────────────────────────────────
 def project(args):
@@ -1486,8 +1507,17 @@ def cfg_load():
 def cfg_set(key, value):
     d = cfg_load(); d[key] = value
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n"); tmp.replace(CONFIG)
+    # Имя временного файла — с номером процесса: общее «config.tmp» два
+    # задания по расписанию пишут одновременно, один переименовывает первым,
+    # второй падает с FileNotFoundError. Ловилось на watch и report.
+    tmp = CONFIG.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n")
+        tmp.replace(CONFIG)
+    finally:
+        if tmp.exists():
+            try: tmp.unlink()
+            except OSError: pass
 
 def reports_dir():
     """Куда складывать отчёты. Запомненный путь главнее умолчания."""
