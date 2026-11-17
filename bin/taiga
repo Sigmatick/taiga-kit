@@ -4796,20 +4796,41 @@ def cmd_notify(args):
     for x in fresh: byuser.setdefault(x["uid"], []).append(x)
     for uid, items in byuser.items():
         who = items[0]["name"]
-        if len(items) > int(args.max):
-            # Падать нельзя: это задание по расписанию, и останов лишил бы
-            # уведомлений всех остальных. Пропускаем одного, отметку не ставим.
-            ok(f"{who}: к отправке {len(items)} — больше порога {args.max}, пропускаю. "
-               f"Посмотреть: taiga notify --dry")
-            continue
-        head = "Вам назначена карточка:" if len(items) == 1 else f"Вам назначено карточек: {len(items)}"
+        # Превышение порога раньше глушило человека целиком и отметку не
+        # ставило: на следующем прогоне повторялось то же самое. У Жанахметова
+        # так вышел 121 пропуск подряд — уведомления молчали, пока очередь
+        # не рассосалась сама. Теперь порог означает «не расписывать каждую»,
+        # а не «молчать»: подробно первые, остальные — номерами.
+        many = len(items) > int(args.max)
+        head = ("Вам назначена карточка:" if len(items) == 1
+                else f"Вам назначено карточек: {len(items)}")
         lines = [head, ""]
         for x in items[:10]:
             lines.append(f"{st_icon(x['st'])} {x['pr']} #{x['ref']} · {x['st']}")
             lines.append(cut(x["subj"], 120))
             lines.append(x["url"]); lines.append("")
-        if len(items) > 10: lines.append(f"…и ещё {len(items)-10}")
+        rest = items[10:]
+        if rest:
+            # Номера, а не «…и ещё N»: по голому счётчику человек не узнает,
+            # что именно ему досталось, и пойдёт искать руками.
+            byp = {}
+            for x in rest: byp.setdefault(x["pr"], []).append(x["ref"])
+            lines.append(f"Ещё {len(rest)}:")
+            for pr in sorted(byp):
+                lines.append(f"  {pr}: " + ", ".join(f"#{r}" for r in sorted(byp[pr])))
+            lines.append("")
+            lines.append("Весь список — напишите «задачи».")
         txt = "\n".join(lines).strip()
+        # Telegram рвёт сообщение длиннее 4096, и тогда не доходит НИЧЕГО.
+        # Режем сами, по строкам, честно говоря об остатке.
+        if len(txt) > 3900:
+            keep, used = [], 0
+            for ln in txt.splitlines():
+                if used + len(ln) + 1 > 3800: break
+                keep.append(ln); used += len(ln) + 1
+            txt = "\n".join(keep).rstrip() + "\n\n…список не поместился целиком. Напишите «задачи»."
+        if many: ok(f"{who}: карточек {len(items)} — порог {args.max}, "
+                    f"шлю сводкой (подробно 10, остальные номерами)")
         if args.dry:
             ok(f"── {who} ──"); ok(txt); ok(""); continue
         r = tg_call("sendMessage", {"chat_id": items[0]["chat"], "text": txt,
